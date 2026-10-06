@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import stat
 import tempfile
+from kiosk_platform import boot_directory
 
 PARAMETERS = ('video=DSI-1:panel_orientation=right_side_up', 'fbcon=rotate:1', 'consoleblank=0')
 
@@ -48,9 +49,25 @@ def cmdline_text(path):
     return ' '.join(tokens + list(PARAMETERS)) + '\n'
 
 
-def config_text(path, replace_kms=False):
+def config_text(path, replace_kms=False, board=None):
     lines = Path(path).read_text(encoding='utf-8').splitlines()
     overlay = 'dtoverlay=vc4-kms-dsi-7inch'
+    if board is not None:
+        # A Pi 5-only overlay must not count as installed on a Pi 4 (or vice versa).
+        # Put missing settings in [all] so a trailing [cm4]/[pi5] filter cannot hide them.
+        active = True
+        active_settings = []
+        for line in lines:
+            setting = line.split('#', 1)[0].strip()
+            if setting.startswith('[') and setting.endswith(']'):
+                active = setting in ('[all]', f'[pi{board}]')
+            elif active:
+                active_settings.append(setting.split(',', 1)[0])
+        missing = [setting for setting in ('dtoverlay=vc4-kms-v3d', overlay)
+                   if setting not in active_settings]
+        if missing:
+            lines.extend(['', '[all]', *missing])
+        return '\n'.join(lines) + '\n'
     has_overlay = any(line.strip() == overlay for line in lines)
     output = []
     found = False
@@ -73,18 +90,26 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('kind', choices=('cmdline', 'config', 'legacy'))
     parser.add_argument('path')
-    parser.add_argument('--cmdline', default='/boot/firmware/cmdline.txt')
+    parser.add_argument('--cmdline')
+    parser.add_argument('--board', choices=('4', '5'), help='Respect board-specific config sections')
+    parser.add_argument('--check', action='store_true', help='Validate edits without writing files')
     args = parser.parse_args()
     try:
         if args.kind == 'cmdline':
-            update_file(args.path, cmdline_text(args.path))
+            text = cmdline_text(args.path)
+            if not args.check:
+                update_file(args.path, text)
         else:
             # Compute both edits before changing either file.
-            text = config_text(args.path, replace_kms=args.kind == 'legacy')
-            cmdline = cmdline_text(args.cmdline) if args.kind == 'legacy' else None
-            update_file(args.path, text)
-            if cmdline is not None:
-                update_file(args.cmdline, cmdline)
+            text = config_text(args.path, replace_kms=args.kind == 'legacy', board=args.board)
+            cmdline_path = args.cmdline
+            if args.kind == 'legacy':
+                cmdline_path = cmdline_path or str(boot_directory() / 'cmdline.txt')
+            cmdline = cmdline_text(cmdline_path) if args.kind == 'legacy' else None
+            if not args.check:
+                update_file(args.path, text)
+                if cmdline is not None:
+                    update_file(cmdline_path, cmdline)
     except (OSError, ValueError) as exc:
         parser.exit(1, f'Error: {exc}\n')
 

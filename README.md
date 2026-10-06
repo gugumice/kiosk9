@@ -4,6 +4,59 @@ The application runs on a Raspberry Pi with an X11 touchscreen, a serial barcode
 reader, and a CUPS printer. `kiosk.ini` defines the display, languages, report host,
 printer models, and optional watchdog.
 
+## Install on Raspberry Pi 4 or 5
+
+Copy or unpack this package on the target Raspberry Pi, then run from its folder:
+
+```sh
+bash install.sh --check
+sudo bash install.sh
+sudo reboot
+```
+
+Use Raspberry Pi OS Lite with `raspi-config` installed; 64-bit Bookworm is the
+recommended baseline for this package. Installation needs Internet access for
+APT and Python dependencies, and an existing local user account. By default the
+kiosk runs as the user who invoked `sudo`, or `pi` when launched directly as root.
+To choose another existing account:
+
+```sh
+sudo KIOSK_USER=kioskuser bash install.sh
+```
+
+`--check` only validates the board, account and boot files; it changes nothing.
+The installer detects Raspberry Pi 4 Model B and Raspberry Pi 5 Model B, copies
+the application to `/opt/kiosk`, installs packages, creates a local Python
+environment and registers the boot services. It excludes the source `.venv`,
+review backups, bytecode and old image caches. On repeat installs, the target's
+`kiosk.ini` and log are retained. Provisioning rebuilds `.venv` and installs
+dependencies from `requirements.txt` so an in-place copy cannot keep binaries
+from a different CPU architecture or Python version. Use the installer with a
+source copy when moving the package to another Pi.
+
+Boot files are detected as a pair in `/boot/firmware` or `/boot`. Display setup
+keeps `vc4-kms-v3d` and the existing `vc4-kms-dsi-7inch` panel overlay, including
+its parameters, and respects `[pi4]`/`[pi5]` sections when checking for missing
+settings. Boot edits retain backups. The firmware's conditional sections and
+panel requirements are documented in the [Raspberry Pi config reference](https://www.raspberrypi.com/documentation/computers/config_txt.html)
+and [overlay reference](https://github.com/raspberrypi/firmware/blob/master/boot/overlays/README).
+
+This provisions the current 800×480 DSI panel rotated to portrait, USB serial
+scanner and CUPS printer setup. A different panel needs its own display
+configuration. Use a Lite image so a desktop display manager does not compete
+with the kiosk's X server. Edit `/opt/kiosk/kiosk.ini` for the target's report
+host, printer and working hours before rebooting.
+
+Connect Ethernet with DHCP before the first reboot. First-boot setup configures
+the hostname (`rapi4-kiosk9DSI-…` or `rapi5-kiosk9DSI-…`), retains the existing
+network/time settings, enables the kiosk and requests a second reboot. It retries
+on a later boot if Ethernet has no usable IPv4 address. The existing daily reboot
+schedule remains 10:02 Europe/Riga.
+
+Pi 4/5 model fixtures, both boot layouts, conditional display settings and source
+copying are covered by offline regression tests. Physical Pi 4 installation,
+touch alignment, audio and printing still require validation on the target.
+
 ## Running
 
 Use the existing virtual environment:
@@ -38,9 +91,9 @@ Monday as 0. An overnight shift's early hours belong to the preceding workday.
 
 ## Setup scripts
 
-`preppi.sh` installs packages and configures the machine; `initkio.sh` performs
-first-boot setup and requests a reboot. Run these deliberately as root when
-provisioning a kiosk. They were reviewed but not executed during this review.
+`install.sh` copies and provisions a source package; `preppi.sh` installs packages
+and configures an existing `/opt/kiosk` copy. `initkio.sh` performs first-boot setup
+and requests a reboot. Run these deliberately as root when provisioning a kiosk.
 
 Boot-config wrappers accept fixture paths as well as real boot files:
 
@@ -50,7 +103,9 @@ Boot-config wrappers accept fixture paths as well as real boot files:
 ```
 
 The legacy `update_config.sh` replaces the KMS overlay and updates the command
-line. `CMDLINE_FILE` can override its command-line destination. All three use
+line beside the given config file. `CMDLINE_FILE` can override its command-line
+destination; `update_cmdline.sh` detects the boot directory when no path is given.
+All three use
 `kiosk_boot_config.py`, retain backups of changed files, preserve file metadata,
 and avoid duplicate settings on repeat runs. Other display outputs' `video=`
 settings are preserved.
@@ -156,7 +211,8 @@ systemd-analyze verify ./*.service
 .venv/bin/python -m pip check
 ```
 
-54 regression tests pass. Expected error-path tests log errors and warnings.
+66 regression tests pass, including the Pi 4/5 installer fixtures added on
+2026-10-06. Expected error-path tests log errors and warnings.
 ShellCheck, Python compilation, systemd validation, module imports, source GIF
 loading, and dependency checks pass.
 

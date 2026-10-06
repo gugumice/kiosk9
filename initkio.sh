@@ -10,7 +10,10 @@ if [[ ! "$ip_address" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
     echo "No usable eth0 IPv4 address; first-boot setup will retry on the next boot" >&2
     exit 1
 fi
-new_hostname="rapi5-kiosk9DSI-${BASH_REMATCH[2]}"
+hostname_suffix=${BASH_REMATCH[2]}
+WORK_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+board=$(python3 "$WORK_DIR/kiosk_platform.py" board)
+new_hostname="rapi${board}-kiosk9DSI-${hostname_suffix}"
 raspi-config nonint do_expand_rootfs
 cp -p /etc/hosts "/etc/hosts.$(date +%Y%m%d-%H%M%S-%N).bak"
 hostnamectl set-hostname "$new_hostname" --static
@@ -33,8 +36,10 @@ done
 install -d -m 755 /etc/systemd/timesyncd.conf.d
 printf '[Time]\nFallbackNTP=laiks.egl.local\n' > /etc/systemd/timesyncd.conf.d/kiosk.conf
 crontab -l > "$cron_temp" 2>/dev/null || true
-if ! grep -Eq '^[[:space:]]*0[[:space:]]+1[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+/sbin/reboot[[:space:]]*$' "$cron_temp"; then
-    printf '\n02 10 * * * sudo reboot 2>/home/pi/reboot.log\n' >> "$cron_temp"
+# Migrate the earlier entry without scheduling two reboots at the same time.
+sed -i '\|^02 10 \* \* \* sudo reboot 2>/home/pi/reboot.log$|d' "$cron_temp"
+if ! grep -Eq '^[[:space:]]*02[[:space:]]+10[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+/sbin/reboot[[:space:]]+# kiosk daily reboot$' "$cron_temp"; then
+    printf '\n02 10 * * * /sbin/reboot # kiosk daily reboot\n' >> "$cron_temp"
 fi
 crontab "$cron_temp"
 systemctl enable kiosk.service

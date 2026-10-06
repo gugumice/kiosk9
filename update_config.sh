@@ -5,4 +5,5 @@ if (( $# != 1 )); then
     echo "Usage: $0 <config_file>" >&2
     exit 1
 fi
-exec python3 "$SCRIPT_DIR/kiosk_boot_config.py" legacy "$1" --cmdline "${CMDLINE_FILE:-/boot/firmware/cmdline.txt}"
+CMDLINE_PATH=${CMDLINE_FILE:-$(dirname -- "$1")/cmdline.txt}
+exec python3 "$SCRIPT_DIR/kiosk_boot_config.py" legacy "$1" --cmdline "$CMDLINE_PATH"
