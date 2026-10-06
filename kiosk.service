@@ -1,0 +1,21 @@
+[Unit]
+Description=Kiosk printer v8 DSI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+#Type=idle
+#Environment="SCRIPT_ARGS=-c /opt/kiosk/kiosk.ini"
+ExecStart="/opt/kiosk/st.sh"
+
+WorkingDirectory=/opt/kiosk/
+StandardOutput=inherit
+StandardError=inherit
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+User=pi
+
+[Install]
+WantedBy=multi-user.target
+

@@ -1,0 +1,16 @@
+[Unit]
+Description=Wait for eth0 DHCP address
+After=NetworkManager.service
+Wants=NetworkManager.service
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/kiosk/wait-for-ethernet.sh
+RemainAfterExit=yes
+TimeoutStartSec=190
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

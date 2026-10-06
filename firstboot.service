@@ -1,0 +1,12 @@
+[Unit]
+Description=First time boot config script launcher
+After=network-online.target wait-for-ethernet.service
+Wants=network-online.target wait-for-ethernet.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=300
+RemainAfterExit=yes
+ExecStart=/opt/kiosk/initkio.sh
+[Install]
+WantedBy=multi-user.target 

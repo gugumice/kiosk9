@@ -1,0 +1,14 @@
+[Unit]
+Description=Clear previous CUPS print jobs once per boot
+DefaultDependencies=no
+RequiresMountsFor=/opt/kiosk /etc/cups /var/spool/cups /var/cache/cups
+After=local-fs.target
+Before=cups.service cups.socket cups.path shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/kiosk/kiosk_clear_print_jobs.py
+RemainAfterExit=yes
+TimeoutStartSec=60
+User=root

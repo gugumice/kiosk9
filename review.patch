@@ -1,0 +1,4060 @@
+--- /dev/null
++++ after/README.md
+@@ -0,0 +1,176 @@
++# EGL report kiosk
++
++The application runs on a Raspberry Pi with an X11 touchscreen, a serial barcode
++reader, and a CUPS printer. `kiosk.ini` defines the display, languages, report host,
++printer models, and optional watchdog.
++
++## Running
++
++Use the existing virtual environment:
++
++```sh
++/opt/kiosk/.venv/bin/python /opt/kiosk/kiosk_main.py -c /opt/kiosk/kiosk.ini
++```
++
++This requires a running X server. `/opt/kiosk/st.sh` starts X and the application;
++`start_kiosk.sh` runs the application within an existing X session.
++`start_tk.sh` delegates to that launcher. `gui_simm.py` runs the actual hardware
++worker with console output instead of a GUI. It is not a hardware simulation.
++
++For the installed systemd service:
++
++```sh
++sudo systemctl start kiosk.service
++journalctl -u kiosk.service -f
++```
++
++At boot, `kiosk-clear-print-jobs.service` removes previous print jobs from every
++queue before CUPS, its socket, or its path activation can start. Printer
++definitions remain installed. New test pages submitted after cleanup are
++preserved across later kiosk and CUPS restarts. The startup printer-reset button
++explicitly deletes all CUPS printer definitions when pressed. Set `button_printer_reset =` in `[REPORT]` to disable that reset option.
++The configured value `1` selects the second language button.
++
++`--config` is respected. Relative asset and log paths resolve against the
++configuration file's directory. The legacy spelling `bc_reader_boudrate` is
++preserved for compatibility. Working hours use `HH:MM`; weekdays use 0–6, with
++Monday as 0. An overnight shift's early hours belong to the preceding workday.
++
++## Setup scripts
++
++`preppi.sh` installs packages and configures the machine; `initkio.sh` performs
++first-boot setup and requests a reboot. Run these deliberately as root when
++provisioning a kiosk. They were reviewed but not executed during this review.
++
++Boot-config wrappers accept fixture paths as well as real boot files:
++
++```sh
++./update_config_txt.sh /path/to/config.txt
++./update_cmdline.sh /path/to/cmdline.txt
++```
++
++The legacy `update_config.sh` replaces the KMS overlay and updates the command
++line. `CMDLINE_FILE` can override its command-line destination. All three use
++`kiosk_boot_config.py`, retain backups of changed files, preserve file metadata,
++and avoid duplicate settings on repeat runs. Other display outputs' `video=`
++settings are preserved.
++
++`wait-for-ethernet.sh` leaves link negotiation automatic and limits its total
++wait to 180 seconds by default. `eth-speed.service` invokes the alternative
++`check-ethernet.sh`, which tries negotiation first and then a 10 Mbps fallback.
++`10eth-speed.service` is the original legacy forced-speed alternative. These are
++separate provisioning choices; do not enable conflicting Ethernet setup units.
++
++## Review completed 2026-10-02
++
++All 22 original application scripts (9 Python and 13 shell) and 5 service units
++were examined. There were no application scripts in `assets/`. Installed
++third-party source and generated launchers inside `.venv` were left intact;
++`pip check` reported no broken requirements. A shared boot-editing helper,
++dependency manifest, and regression checks were added.
++
++Changes include:
++
++- Consistent report-download results for timeouts, connection failures, non-PDF
++  responses, and errors writing temporary files. Temporary reports are removed
++  after successful or failed processing. PDF and audio subprocesses use argument
++  lists rather than interpolated shell commands.
++- Complete barcode validation, URL encoding, monotonic debounce, invalid-byte
++  handling, and reconnection after scanner disconnection. Production barcode
++  values and report access URLs are no longer logged by these scripts.
++- Correct printer-install failure handling and default-printer selection. Normal
++  startup preserves unrelated printer definitions and completes printer installation without an unsolicited test page or reboot.
++- Correct delayed language-button enablement, language selection when waking the
++  display, popup icon reuse, animation-cycle reset and timer cancellation,
++  explicit ticket duration, and nonfatal unsupported backlight/DPMS operations.
++- Configuration validation, corrected defaults, `--config` handling, config-relative
++  paths, and actual file logging when requested.
++- Stoppable worker retries, scanner closure, watchdog closure, SIGTERM handling,
++  and process exit if the worker unexpectedly dies so systemd can restart it.
++- Setup fixes for a malformed package name, working-directory assumptions,
++  omitted dependencies, unsafe predictable temporary files, duplicate hosts/cron
++  entries, early disabling of first-boot setup, and indefinite boot blocking.
++  Provisioning now uses its virtual environment without altering global pip
++  policy or automatically enabling remote CUPS administration.
++- GIFs are loaded from their source images into an in-memory cache. Legacy
++  `.pkl` files are retained but ignored; cache files cannot execute code and
++  image changes or new dimensions apply at the next launch. Decoding all eight
++  current GIFs takes about 9 seconds on this Pi at the configured 290×290 size.
++
++Original files are in `.review-backups/20261002-135003/`, with SHA-256 hashes in
++`manifest.json`. `review.patch` contains the complete difference from that
++snapshot, including newly added files. There is no Git repository here.
++
++The installed service files for kiosk, firstboot, and Ethernet waiting were
++hard-linked to their copies here, so their edits also updated the installed
++files. Systemd definitions were reloaded without starting or enabling a service.
++At the end of the initial review, the kiosk was disabled and stopped, and CUPS
++was active. Live boot settings, network connections, and printer queues were not
++changed during that initial validation. The follow-up boot cleanup below was
++subsequently installed and verified.
++
++## Print-job cleanup on boot
++
++The installed `kiosk-clear-print-jobs.service` runs once per boot before all three
++CUPS activation paths (`cups.service`, `cups.socket`, and `cups.path`). Their
++installed drop-ins require successful cleanup before starting CUPS. This also
++works when the kiosk GUI is disabled. `RemainAfterExit=yes` prevents a later
++CUPS restart from clearing newly queued jobs or test pages again.
++
++`kiosk_clear_print_jobs.py` reads `RequestRoot` and `CacheDir` from
++`/etc/cups/cups-files.conf`. While CUPS is stopped, it removes old job control and
++document files from all printer queues, including interrupted-write recovery
++files. It empties the job caches while retaining the next job ID and file
++metadata. Printer definitions, PPDs, and printer caches are preserved. Old stored
++job records are cleared along with the spool, including old test-page jobs;
++needed test pages should be submitted after boot cleanup. Ordinary printer
++initialization no longer cancels those new jobs.
++
++CUPS loads jobs from both its spool and cache; the cleanup handles both, as shown
++in the [upstream CUPS job loader](https://github.com/OpenPrinting/cups/blob/master/scheduler/job.c).
++The cleaner refuses to modify a live scheduler's spool. A read-only inspection is:
++
++```sh
++sudo /usr/bin/python3 /opt/kiosk/kiosk_clear_print_jobs.py --dry-run
++journalctl -u kiosk-clear-print-jobs.service
++```
++
++The boot rule and all three drop-ins are installed on this computer. After
++confirming no pending jobs, CUPS was stopped briefly, the boot rule installed,
++and CUPS restarted through the new dependencies. Cleanup succeeded, retaining
++next job ID 2; all CUPS units returned to active. The computer was not rebooted.
++The kiosk GUI was not started by this follow-up change; it is currently running
++but remains disabled for automatic startup. `preppi.sh` also installs the same boot rule when
++provisioning another computer.
++
++Backups before this follow-up change are in
++`.review-backups/print-startup-20261002-142143/`.
++
++## Validation
++
++```sh
++.venv/bin/python -m unittest discover -s tests -v
++.venv/bin/python -m compileall -q ./*.py tests
++shellcheck ./*.sh
++systemd-analyze verify ./*.service
++.venv/bin/python -m pip check
++```
++
++54 regression tests pass. Expected error-path tests log errors and warnings.
++ShellCheck, Python compilation, systemd validation, module imports, source GIF
++loading, and dependency checks pass.
++
++`tests/gui_smoke.py` also passed against a temporary virtual X server. It exercises
++real widgets: initial display, selecting a language while waking from power
++save, button debounce, popup reuse, changing icons, explicit ticket duration,
++and clean shutdown. Hardware calls are mocked and no worker is started.
++
++```sh
++DISPLAY=:99 .venv/bin/python tests/gui_smoke.py
++```
++
++A virtual X server must already be running at that display. ShellCheck and Xvfb
++were extracted into `/tmp/kiosk-review-tools` for validation; no system packages
++were installed for the checks. Real touchscreen alignment, audio, host report
++access, and physical printing were not exercised. A successful CUPS submission
++means the queue accepted a job; it does not prove that paper was printed.
+--- before/change_cups-browsed.sh
++++ after/change_cups-browsed.sh
+@@ -1,44 +1,29 @@
+-#!/bin/bash
+-
+-CONFIG_FILE="/etc/cups/cups-browsed.conf"
+-BACKUP_FILE="/etc/cups/cups-browsed.conf.bak"
+-
+-backup_config_file() {
+-    if [[ ! -f "$CONFIG_FILE" ]]; then
+-        printf "Error: Configuration file not found: %s\n" "$CONFIG_FILE" >&2
+-        return 1
+-    fi
+-    cp "$CONFIG_FILE" "$BACKUP_FILE" || {
+-        printf "Error: Failed to create backup file: %s\n" "$BACKUP_FILE" >&2
+-        return 1
++#!/usr/bin/env bash
++set -euo pipefail
++CONFIG_FILE="${1:-/etc/cups/cups-browsed.conf}"
++if (( $# > 1 )) || [[ ! -f "$CONFIG_FILE" ]]; then
++    echo "Usage: $0 [existing_cups_browsed_config]" >&2
++    exit 1
++fi
++CONFIG_FILE=$(readlink -f -- "$CONFIG_FILE")
++TMP_FILE=$(mktemp "${CONFIG_FILE}.tmp.XXXXXX")
++trap 'rm -f -- "$TMP_FILE"' EXIT
++# Replace any active setting, or add one if only commented defaults exist.
++awk '
++    /^[[:space:]]*BrowseRemoteProtocols[[:space:]]+/ {
++        if (!found++) print "BrowseRemoteProtocols none"
++        next
+     }
+-}
+-
+-sanitize_and_replace_protocols() {
+-    local tmpfile; tmpfile=$(mktemp)
+-    if ! sed -E 's/^\s*BrowseRemoteProtocols\s+dnssd\s*$/BrowseRemoteProtocols none/' "$CONFIG_FILE" > "$tmpfile"; then
+-        printf "Error: Failed to process configuration file\n" >&2
+-        rm -f "$tmpfile"
+-        return 1
+-    fi
+-
+-    if ! grep -q '^BrowseRemoteProtocols none$' "$tmpfile"; then
+-        printf "Error: Replacement did not occur, pattern not found\n" >&2
+-        rm -f "$tmpfile"
+-        return 1
+-    fi
+-
+-    mv "$tmpfile" "$CONFIG_FILE" || {
+-        printf "Error: Failed to update configuration file\n" >&2
+-        rm -f "$tmpfile"
+-        return 1
+-    }
+-}
+-
+-main() {
+-    backup_config_file || return 1
+-    sanitize_and_replace_protocols || return 1
+-    printf "Configuration updated successfully: %s\n" "$CONFIG_FILE"
+-}
+-
+-main+    {print}
++    END {if (!found) print "BrowseRemoteProtocols none"}
++' "$CONFIG_FILE" > "$TMP_FILE"
++if cmp -s -- "$CONFIG_FILE" "$TMP_FILE"; then
++    echo "Already configured: $CONFIG_FILE"
++    exit 0
++fi
++cp -p -- "$CONFIG_FILE" "${CONFIG_FILE}.$(date +%Y%m%d-%H%M%S-%N).bak"
++# Preserve metadata and replace atomically on the same filesystem.
++chmod --reference="$CONFIG_FILE" "$TMP_FILE"
++chown --reference="$CONFIG_FILE" "$TMP_FILE"
++mv -f -- "$TMP_FILE" "$CONFIG_FILE"
++echo "Configuration updated: $CONFIG_FILE"
+--- before/check-ethernet.sh
++++ after/check-ethernet.sh
+@@ -1,6 +1,6 @@
+ #!/bin/bash
+ 
+-INTERFACE="eth0"
++INTERFACE="${INTERFACE:-eth0}"
+ ETHTOOL="/usr/sbin/ethtool"
+ IP="/usr/sbin/ip"
+ NMCLI="/usr/bin/nmcli"
+@@ -90,13 +90,13 @@
+ {
+     log "Restarting NetworkManager connection for ${INTERFACE}"
+ 
+-    "$NMCLI" device disconnect "$INTERFACE" >/dev/null 2>&1 || true
++    "$NMCLI" --wait 10 device disconnect "$INTERFACE" >/dev/null 2>&1 || true
+     sleep 2
+-    "$NMCLI" device connect "$INTERFACE" >/dev/null 2>&1 || true
++    "$NMCLI" --wait 10 device connect "$INTERFACE" >/dev/null 2>&1 || true
+ }
+ 
+ # Wait for the kernel to create eth0.
+-for attempt in $(seq 1 30); do
++for (( attempt=0; attempt<30; attempt++ )); do
+     if interface_exists; then
+         break
+     fi
+@@ -110,7 +110,10 @@
+ fi
+ 
+ log "Trying default Ethernet settings"
+-"$ETHTOOL" -s "$INTERFACE" autoneg on
++if ! "$ETHTOOL" -s "$INTERFACE" autoneg on; then
++    log "ERROR: Failed to enable Ethernet auto-negotiation"
++    exit 1
++fi
+ 
+ restart_network_connection
+ 
+--- before/eth-speed.service
++++ after/eth-speed.service
+@@ -7,7 +7,7 @@
+ Type=oneshot
+ ExecStart=/opt/kiosk/check-ethernet.sh
+ RemainAfterExit=yes
+-TimeoutStartSec=120
++TimeoutStartSec=180
+ 
+ [Install]
+ WantedBy=multi-user.target
+--- before/firstboot.service
++++ after/firstboot.service
+@@ -1,10 +1,12 @@
+ [Unit]
+ Description=First time boot config script launcher
+-After=network-online.target
+-Wants=network-online.target
++After=network-online.target wait-for-ethernet.service
++Wants=network-online.target wait-for-ethernet.service
+ 
+ [Service]
+-Type=simple
++Type=oneshot
++TimeoutStartSec=300
++RemainAfterExit=yes
+ ExecStart=/opt/kiosk/initkio.sh
+ [Install]
+ WantedBy=multi-user.target 
+--- before/fonts.py
++++ after/fonts.py
+@@ -5,12 +5,8 @@
+ 
+ 
+ 
+-root = tk.Tk()
+-root.title('Font Families')
+-root.geometry('480x800')
+-fonts=list(font.families())
+-print(fonts)
+-fonts.sort()
++root = None
++fonts = []
+ 
+ def populate(frame):
+     '''Put in the fonts'''
+@@ -30,17 +26,27 @@
+     '''Reset the scroll region to encompass the inner frame'''
+     canvas.configure(scrollregion=canvas.bbox("all"))
+ 
+-canvas = tk.Canvas(root, borderwidth=0, background="#ffffff")
+-frame = tk.Frame(canvas, background="#ffffff")
+-vsb = tk.Scrollbar(root, orient="vertical", command=canvas.yview)
+-canvas.configure(yscrollcommand=vsb.set)
++def main():
++    global root, fonts
++    root = tk.Tk()
++    root.title('Font Families')
++    root.geometry('480x800')
++    fonts = sorted(font.families(root))
++    canvas = tk.Canvas(root, borderwidth=0, background="#ffffff")
++    frame = tk.Frame(canvas, background="#ffffff")
++    vsb = tk.Scrollbar(root, orient="vertical", command=canvas.yview)
++    canvas.configure(yscrollcommand=vsb.set)
++    
++    vsb.pack(side="right", fill="y")
++    canvas.pack(side="left", fill="both", expand=True)
++    canvas.create_window((4,4), window=frame, anchor="nw")
++    
++    frame.bind("<Configure>", lambda event, canvas=canvas: onFrameConfigure(canvas))
++    
++    populate(frame)
++    
++    root.mainloop()
+ 
+-vsb.pack(side="right", fill="y")
+-canvas.pack(side="left", fill="both", expand=True)
+-canvas.create_window((4,4), window=frame, anchor="nw")
+ 
+-frame.bind("<Configure>", lambda event, canvas=canvas: onFrameConfigure(canvas))
+-
+-populate(frame)
+-
+-root.mainloop()+if __name__ == '__main__':
++    main()
+--- before/gui_simm.py
++++ after/gui_simm.py
+@@ -1,92 +1,51 @@
+ #!/usr/bin/env python3
++"""Run the kiosk worker with console output instead of the touchscreen GUI."""
++import argparse
++import logging
++import os
++from pathlib import Path
++from queue import Empty, Queue
+ import threading
+-from kiosk_bcr import BarcodeReader
++
+ import kiosk_config
+-import argparse
+-import os, sys
+-from kiosk_utils import Ticket, TicketPurpose, send_ticket
+ import kiosk_service
+-import logging
+-from queue import Queue
++from kiosk_utils import Ticket
+ 
+-queue_from_gui = Queue() # Queue for receiving messages from service thread
+-queue_to_gui = Queue() # Queue for sending messages to service thread
+-polling_int = 0.5
+-
+-logging.basicConfig(
+-    format="%(asctime)s - %(message)s",
+-    level=os.environ.get("LOGLEVEL", "DEBUG")
+-)
+ 
+ def main():
+-    global config, queue_from_gui, queue_to_gui, polling_int    
+-    # Parse command line arguments
+-    parser = argparse.ArgumentParser(description="EGL testing report kiosk application.")
+-    parser.add_argument(
+-        "-c",
+-        "--config",
+-        type=str,
+-        metavar="file",
+-        help="Name config file. Default: kiosk.ini",
+-        default=os.path.join(os.getcwd(),'kiosk.ini'),
+-    )
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('-c', '--config', default=str(Path(__file__).with_name('kiosk.ini')))
+     args = parser.parse_args()
+-    if not os.path.isfile('{}'.format(args.config)):
+-        print('Config file not found in current directory.')
+-        sys.exit(1)
+-    # Read the config file
+-    config = kiosk_config.read_config(os.path.join(os.getcwd(),'kiosk.ini'))
+-
+-    #Set logging
+-    if config["log_file"] is None:
+-        logging.basicConfig(format="%(asctime)s - %(message)s", level=os.environ.get('LOGLEVEL', config['log_level']).upper())
+-        
+-        #logging.basicConfig(format="%(asctime)s - %(message)s", level=logging.INFO)
+-    else:
+-        logging.basicConfig(
+-            format="%(asctime)s - %(message)s",
+-            filename=config["log_file"],
+-            filemode="w",
+-            level=os.environ.get('LOGLEVEL', config['log_level']).upper(),
+-        )
+-    logging.info('Starting kiosk service'.format(config))
+-    # Start service thread
+-    # Start service thread
+-    th_ev = threading.Event()
+-    t1 = threading.Thread(
+-        target=kiosk_service.service_thread,
+-        kwargs=dict(
+-            th_ev=th_ev,
+-            polling_int=polling_int,
+-            config=config,
+-            queue_from_gui=queue_from_gui,
+-            queue_to_gui=queue_to_gui,
+-        ),
+-        daemon=True)
+-    t1.start()
+-    logging.info("Service_thread: {}".format(t1.is_alive()))
+-    running = True
++    config = kiosk_config.read_config(args.config)
++    if config is None:
++        parser.exit(1, 'Invalid configuration\n')
++    logging.basicConfig(format='%(asctime)s - %(message)s',
++                        level=os.environ.get('LOGLEVEL', config['log_level']).upper(),
++                        filename=config['log_file'], force=True)
++    outgoing, incoming = Queue(), Queue()
++    stop = threading.Event()
++    worker = threading.Thread(target=kiosk_service.service_thread, kwargs={
++        'th_ev': stop, 'config': config, 'queue_from_gui': outgoing, 'queue_to_gui': incoming,
++    }, daemon=True)
++    worker.start()
++    interrupted = False
+     try:
+-        while running:
+-            print('.', end='', flush=True)  # Print a dot to indicate the listener is running
+-            threading.Event().wait(1)
+-            if not queue_to_gui.empty():
+-                message = queue_to_gui.get()
+-                logging.debug(f"Message from queue: {message.ticket_value}: {message.ticket_type}")
+-                if isinstance(message, Ticket):
+-                    # Process the ticket
+-                    logging.info(f"Processing ticket: {message.ticket_value} of type {message.ticket_type}")
+-                else:
+-                    logging.warning(f"Unknown message type in queue: {type(message)}")
+-        t1.thread.join()
++        while worker.is_alive():
++            try:
++                message = incoming.get(timeout=0.5)
++            except Empty:
++                continue
++            if isinstance(message, Ticket):
++                print(f'{message.ticket_type.name}: {message.ticket_value or ""}', flush=True)
++            else:
++                logging.warning('Unknown message type: %s', type(message))
+     except KeyboardInterrupt:
+-        logging.info('Keyboard interrupt received, stopping barcode reader')
+-        sys.exit(1)
+-    
+-    # Start the main loop of the application    
++        interrupted = True
++    finally:
++        stop.set()
++        worker.join(timeout=2)
++    return 0 if interrupted else 1
+ 
+ 
+-    
+ if __name__ == '__main__':
+-    print('Starting kiosk service...')
+-    main()+    raise SystemExit(main())
+--- before/initkio.sh
++++ after/initkio.sh
+@@ -1,25 +1,43 @@
+ #!/bin/bash
+-systemctl enable kiosk.service;
+-# Limit eth speed
+-# systemctl enable 10eth-speed.service;
+-systemctl disable firstboot.service;
+-
+-#raspi-config --expand-rootfs;
+-set -e;
+-raspi-config nonint do_expand_rootfs;
+-echo "Root filesystem expanded.";
+-cp /etc/hosts /etc/hosts.backup;
+-oldHostname=$(cat /proc/sys/kernel/hostname);
+-ipo=$(ip -o -4 addr list eth0 | awk '{print $4}' | cut -d/ -f1 |  cut -d. -f2);
+-newHostname="rapi5-kiosk8DSI-${ipo}"
+-hostnamectl set-hostname ${newHostname} --static
+-# printf ${newHostname} > /etc/hostname
+-# sed -i '/^127.0.0.1/s/.*/127.0.0.1\t'${newHostname}'/g' /etc/hosts;
+-sed -i -e 's/'${oldHostname}'/'${newHostname}'/g' /etc/hosts;
+-sed -i '/^#NTP=.*/a FallbackNTP=laiks.egl.local' /etc/systemd/timesyncd.conf;
+-printf '10.100.20.104   laiks.egl.local\n' >> /etc/hosts;
+-printf '10.100.50.102   cache.egl.local\n' >> /etc/hosts;
+-printf "0 1 * * * /sbin/reboot \n" >>  /var/spool/cron/crontabs/root;
+-echo crontab -l
+-sleep 2
+-/sbin/shutdown -r now;
++# One-time boot configuration. Disable this unit only after successful setup.
++set -euo pipefail
++if [[ $EUID -ne 0 ]]; then
++    echo "Run this script as root" >&2
++    exit 1
++fi
++ip_address=$(ip -o -4 addr show dev eth0 scope global | awk 'NR == 1 {split($4, address, "/"); print address[1]}')
++if [[ ! "$ip_address" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
++    echo "No usable eth0 IPv4 address; first-boot setup will retry on the next boot" >&2
++    exit 1
++fi
++new_hostname="rapi5-kiosk8DSI-${BASH_REMATCH[2]}"
++raspi-config nonint do_expand_rootfs
++cp -p /etc/hosts "/etc/hosts.$(date +%Y%m%d-%H%M%S-%N).bak"
++hostnamectl set-hostname "$new_hostname" --static
++# Replace only the local hostname record; keep aliases and unrelated entries intact.
++hosts_temp=$(mktemp)
++cron_temp=$(mktemp)
++trap 'rm -f -- "$hosts_temp" "$cron_temp"' EXIT
++awk -v hostname="$new_hostname" '
++    $1 == "127.0.1.1" {print "127.0.1.1\t" hostname; found=1; next}
++    {print}
++    END {if (!found) print "127.0.1.1\t" hostname}
++' /etc/hosts > "$hosts_temp"
++cat "$hosts_temp" > /etc/hosts
++for entry in '10.100.20.104 laiks.egl.local' '10.100.50.102 cache.egl.local'; do
++    read -r address name <<< "$entry"
++    if ! awk -v name="$name" '{for (i=2; i<=NF; i++) if ($i == name) found=1} END {exit !found}' /etc/hosts; then
++        printf '%s\t%s\n' "$address" "$name" >> /etc/hosts
++    fi
++done
++install -d -m 755 /etc/systemd/timesyncd.conf.d
++printf '[Time]\nFallbackNTP=laiks.egl.local\n' > /etc/systemd/timesyncd.conf.d/kiosk.conf
++crontab -l > "$cron_temp" 2>/dev/null || true
++if ! grep -Eq '^[[:space:]]*0[[:space:]]+1[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+/sbin/reboot[[:space:]]*$' "$cron_temp"; then
++    printf '\n0 1 * * * /sbin/reboot\n' >> "$cron_temp"
++fi
++crontab "$cron_temp"
++systemctl enable kiosk.service
++systemctl disable firstboot.service
++printf '%s\n' 'First-boot setup complete; rebooting.'
++/sbin/shutdown -r now
+--- /dev/null
++++ after/kiosk-clear-print-jobs.service
+@@ -0,0 +1,14 @@
++[Unit]
++Description=Clear previous CUPS print jobs once per boot
++DefaultDependencies=no
++RequiresMountsFor=/opt/kiosk /etc/cups /var/spool/cups /var/cache/cups
++After=local-fs.target
++Before=cups.service cups.socket cups.path shutdown.target
++Conflicts=shutdown.target
++
++[Service]
++Type=oneshot
++ExecStart=/usr/bin/python3 /opt/kiosk/kiosk_clear_print_jobs.py
++RemainAfterExit=yes
++TimeoutStartSec=60
++User=root
+--- before/kiosk.service
++++ after/kiosk.service
+@@ -12,6 +12,8 @@
+ StandardOutput=inherit
+ StandardError=inherit
+ Restart=always
++RestartSec=5
++TimeoutStopSec=15
+ User=pi
+ 
+ [Install]
+--- before/kiosk_animated_label.py
++++ after/kiosk_animated_label.py
+@@ -1,193 +1,144 @@
+ #!/usr/bin/env python3
++"""Load GIF frames from source images and animate them on the Tk main thread."""
++import logging
++import os
++from pathlib import Path
++import tkinter as tk
+ 
+-import tkinter as tk
+-import os
+-import pickle
+ from PIL import Image, ImageSequence, ImageTk
+-import logging
++
+ import kiosk_config
+-from time import sleep
+ 
+-def gif_frames_to_dict(config:dict = None, gifs_keys:list = None) -> dict:
+-    '''
+-    Load GIFs to dict as frames
+-    args
+-    : config - kiosk configuration file
+-    : gifs_keys - List of keys on kiosk config.ini that points to GIF files to be cached
+-    
+-    Returns: dict with Image sequences indexed by GIF  file name
+ 
+-    '''
+-    if gifs_keys is None:
+-        raise Exception('load_frames: No config')
+-    width = config['animated_icon_width']
+-    height = config['animated_icon_height']
+-    gif_cache = dict()
+-    for gif in gifs_keys:
+-        p = os.path.join(config['assets_loader'],config[gif])
+-        logging.info('Adding {} to dict'.format(p))
++def read_frames(path, width=None, height=None):
++    with Image.open(path) as image:
++        frames = []
++        for frame in ImageSequence.Iterator(image):
++            frame = frame.convert('RGBA').copy()
++            if width and height:
++                frame = frame.resize((width, height), Image.Resampling.LANCZOS)
++            frames.append(frame)
++    if not frames:
++        raise ValueError(f'No frames in {path}')
++    return frames
++
++
++def gif_frames_to_dict(config=None, gifs_keys=None):
++    if config is None or gifs_keys is None:
++        raise ValueError('Configuration and GIF keys are required')
++    result = {}
++    for key in gifs_keys:
++        filename = config[key]
+         try:
+-            img = Image.open(os.path.join(config['assets_loader'],config[gif]))
+-        except Exception as e:
+-            logging.error(e)
+-        else:
+-            gif_frames = list()
+-            for frame in ImageSequence.Iterator(img):
+-                frame = frame.copy().convert("RGBA")
+-                if width and height:
+-                    frame = frame.resize((width,height))
+-                gif_frames.append(frame)
+-            gif_cache[config[gif]] = gif_frames
+-    return(gif_cache)
++            result[filename] = read_frames(Path(config['assets_loader']) / filename,
++                                           config['animated_icon_width'], config['animated_icon_height'])
++        except (OSError, ValueError) as exc:
++            logging.warning('Cannot load GIF %s: %s', filename, exc)
++    return result
+ 
+-def save_gif_frames(source:dict, cache_path:str = None) -> None:
+-    '''
+-    Save Dict with GIF frames
+-    to folder using Pickle
+-    '''
++
++def save_gif_frames(source, cache_path=None):
++    """Export image sequences as GIFs; never write executable pickle data."""
+     if cache_path is None:
+-        raise Exception('Destination path not specified')
+-    if not os.path.exists(cache_path):
+-        os.makedirs(cache_path)
+-    for k,v in source.items():
+-        p = os.path.join(cache_path,'{}.pkl'.format(k))
+-        logging.debug('Writing to {}'.format(p))
++        raise ValueError('Destination path not specified')
++    destination = Path(cache_path)
++    destination.mkdir(parents=True, exist_ok=True)
++    for filename, frames in source.items():
++        if frames:
++            frames[0].save(destination / Path(filename).name, format='GIF',
++                           save_all=True, append_images=frames[1:], duration=50, loop=0)
++
++
++def load_gif_frames(source_dir=None, width=None, height=None):
++    """Build an in-memory cache from GIFs. Ignore legacy .pkl caches.
++
++    Accept the former assets/img_cache path for compatibility. Source GIFs are
++    authoritative, so changes to images or dimensions are reflected at startup.
++    """
++    if source_dir is None:
++        raise ValueError('Source directory not specified')
++    source = Path(source_dir)
++    if source.name == 'img_cache':
++        source = source.parent
++    result = {}
++    for path in source.glob('*.gif'):
+         try:
+-            with open(p,'wb') as pf:
+-                pickle.dump(v, pf)
+-        except Exception as e:
+-            logging.error(e)
+-        else:
+-            logging.debug('Success')
++            result[path.name] = read_frames(path, width, height)
++        except (OSError, ValueError) as exc:
++            logging.warning('Cannot load GIF %s: %s', path, exc)
++    return result
+ 
+-def load_gif_frames(source_dir:str=None):
+-    '''
+-    Loads GIFs from Pickle files to Dict
+-    '''
+-    img_cache=dict()
+-    if source_dir is None:
+-        raise Exception('Invalid args: source_dir')
+-    if not os.path.exists(source_dir):
+-        raise Exception('{} not found.'.format(source_dir))
+-    pickle_files = [f for f in os.listdir(source_dir) if f.endswith(".pkl")]
+-    for f in pickle_files:
+-        p = os.path.join(source_dir,f)
+-        logging.debug('Writing {} to cache'.format(p))
+-        try:
+-            with open(p,'rb') as pf:
+-                img_cache[f[:f.rfind('.')]] = pickle.load(pf)
+-        except Exception as e:
+-            logging.error(e)
+-    return(img_cache)
+ 
+ class AnimatedGifLabelAcc(tk.Label):
+-    def __init__(self, master, gif_path:str, delay:int=50, width:int=None, height:int=None, img_cache = None):
+-        super().__init__(master,
+-                        width = width,
+-                        height = height,
+-                        padx = 0,
+-                        pady = 0)
+-        self.width = width
+-        self.height = height
++    def __init__(self, master, gif_path, delay=50, width=None, height=None, img_cache=None):
++        super().__init__(master, padx=0, pady=0)
+         self.gif_path = gif_path
+-        self.delay = delay  # Time between frames in ms
+-        self.Bd = 0
+-        self.frames = []
+-        self.gif_path = gif_path
+-        self.img_cache = dict() if img_cache is None else img_cache
+-        self._load_frames()
++        self.delay = delay
++        self.img_cache = img_cache if img_cache is not None else {}
++        filename = os.path.basename(gif_path)
++        if filename not in self.img_cache:
++            try:
++                self.img_cache[filename] = read_frames(gif_path, width, height)
++            except (OSError, ValueError) as exc:
++                logging.warning('Cannot load animation %s: %s', gif_path, exc)
++                self.img_cache[filename] = []
++        self.frames = [ImageTk.PhotoImage(frame.resize((width, height)) if width and height
++                                         and frame.size != (width, height) else frame, master=self)
++                       for frame in self.img_cache[filename]]
+         self.current_frame = 0
+         self._is_animating = False
+         self._anim_cycles = 0
+         self._curr_cycle = 0
++        self._after_id = None
+ 
+-    def _load_frames(self) -> None:
+-        '''
+-        Creates GIF frames or loads them from img_cache
+-        If GIF frames nor in img_cache - saves trames there
+-        '''
+-        gif_file_name = os.path.basename(self.gif_path)
+-        d = dict()
+-        if gif_file_name not in self.img_cache:
+-            logging.debug('{} not in cache'.format(gif_file_name))
+-            img = Image.open(self.gif_path)
+-            self.frames.clear()
+-            frames = list()
+-            for frame in ImageSequence.Iterator(img):
+-                frame = frame.copy().convert("RGBA")
+-                if self.width and self.height:
+-                    frame = frame.resize((self.width, self.height))
+-                frames.append(frame)
+-            for frame in frames:
+-                self.frames.append(ImageTk.PhotoImage(frame))
+-            # Save image
+-            cache_path = os.path.join(os.path.dirname(self.gif_path), 'img_cache')
+-            if not os.path.exists(cache_path):
+-               os.makedirs(cache_path)
+-            # Create dict for saving
+-            dict_for_cache = dict()
+-            dict_for_cache[gif_file_name] = frames
+-            # Compose Pickle file name
+-            pkl_name = os.path.join(cache_path,'.'.join((gif_file_name,'pkl')))
+-            try:
+-                with open(pkl_name,'wb') as pf:
+-                    pickle.dump(frames, pf)
+-            except Exception as e:
+-                logging.error(e)
+-            else:
+-                logging.debug('Success writing to {}'.format(pkl_name))
+-        else:
+-            logging.debug('{} in cache'.format(gif_file_name))
+-            self.frames.clear()
+-            for frame in self.img_cache[gif_file_name]:
+-                self.frames.append(ImageTk.PhotoImage(frame))
+-
+-    def start_animation(self, cycles = 0):
+-        if not self._is_animating:
+-            self._is_animating = True
+-            self._anim_cycles = cycles
+-            self._animate()
++    def start_animation(self, cycles=0):
++        self.stop_animation()
++        self.current_frame = 0
++        self._curr_cycle = 0
++        self._anim_cycles = cycles
++        self._is_animating = bool(self.frames)
++        self._animate()
+ 
+     def stop_animation(self):
+         self._is_animating = False
++        if self._after_id is not None:
++            self.after_cancel(self._after_id)
++            self._after_id = None
+ 
+     def stopped(self):
+         return not self._is_animating
+-    
++
+     def _animate(self):
+-        if not self._is_animating or not self.frames:
++        self._after_id = None
++        if not self._is_animating:
+             return
+         self.config(image=self.frames[self.current_frame])
+         self.current_frame += 1
+-        if self.current_frame > len(self.frames) - 1:
++        if self.current_frame == len(self.frames):
+             self.current_frame = 0
+-            if self._anim_cycles > 0:
+-                self._curr_cycle += 1
+-        if self._anim_cycles == 0 or self._curr_cycle < self._anim_cycles:
+-            self.after(self.delay, self._animate)
++            self._curr_cycle += 1
++        if self._anim_cycles and self._curr_cycle >= self._anim_cycles:
++            self._is_animating = False
+         else:
+-            self.stop_animation()
++            self._after_id = self.after(self.delay, self._animate)
++
++    def destroy(self):
++        self.stop_animation()
++        super().destroy()
++
+ 
+ def main():
+-    logging.basicConfig(format="%(levelname)s:%(asctime)s - %(message)s", level=logging.DEBUG)
+-    config = kiosk_config.read_config(os.path.join(os.getcwd(),'kiosk.ini'))
+-    image_cache = dict()
+-    try:
+-        image_cache = load_gif_frames(os.path.join(config['assets_loader'],'img_cache'))
+-    except:
+-        pass
+-    print('{} gif(s) loaded'.format(len(image_cache)))
+-    print(image_cache.keys())
+-
++    config = kiosk_config.read_config(Path(__file__).with_name('kiosk.ini'))
++    if config is None:
++        return
+     root = tk.Tk()
+-    root.geometry("300x300")
+-    gif_label = AnimatedGifLabelAcc(root, "assets/loading.gif", delay=40, width=200, height=200, img_cache = image_cache)
+-    gif_label.pack(expand=True)
+-    gif_label.start_animation(1)
+-    
++    root.geometry('300x300')
++    label = AnimatedGifLabelAcc(root, os.path.join(config['assets_loader'], 'loading.gif'),
++                               delay=40, width=200, height=200)
++    label.pack(expand=True)
++    label.start_animation(1)
+     root.mainloop()
+ 
+ 
+-
+-if __name__ == "__main__":
++if __name__ == '__main__':
+     main()
+--- before/kiosk_bcr.py
++++ after/kiosk_bcr.py
+@@ -26,12 +26,13 @@
+         self.status = None
+ 
+     def start(self):
++        self.stop()
+         try:
+             self.serial_connection = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
+             logging.info(f"Barcode reader started on {self.port}")
+             self.running = True
+             self.status = f"OK_opn BC{self.port}"
+-        except serial.SerialException as e:
++        except (serial.SerialException, OSError) as e:
+             logging.error(e)
+             self.status = f"Err_opn BC: {self.port}"
+     
+@@ -46,20 +47,25 @@
+             logging.warning("No callback function defined for barcode reader.")
+     
+     def next(self):
++        if not self.running or self.serial_connection is None:
++            return
+         try:
+             if self.serial_connection.in_waiting > 0:
+                 barcode = self.serial_connection.readline().decode('utf-8').strip()
+                 self.status = f"OK_read {self.port}"
+                 if barcode:
+-                    logging.info(f"Barcode read: {barcode}")
+-                    if self._bounce_timer is None or time.time() > self._bounce_timer + self.bounce:
+-                        self._bounce_timer = time.time()
++                    logging.info('Barcode received')
++                    if self._bounce_timer is None or time.monotonic() > self._bounce_timer + self.bounce:
++                        self._bounce_timer = time.monotonic()
+                         self._cb(barcode, self._config, self._queueTX)
+                     else:
+-                        logging.debug(f"Barcode {barcode} ignored due to bounce protection.")
++                        logging.debug('Barcode ignored due to bounce protection')
+ 
+-        except serial.SerialException as e:
++        except UnicodeDecodeError:
++            logging.warning('Ignoring barcode with invalid UTF-8 encoding')
++        except (serial.SerialException, OSError) as e:
+             logging.error(f"Error reading from barcode reader: {e}")
++            self.stop()
+             self.status = f"Err_read {self.port}"
+     
+     def stop(self):
+@@ -68,7 +74,11 @@
+         """
+         self.running = False
+         if self.serial_connection:
+-            self.serial_connection.close()
++            try:
++                self.serial_connection.close()
++            except (serial.SerialException, OSError) as exc:
++                logging.warning('Error closing barcode reader: %s', exc)
++            self.serial_connection = None
+             logging.info("Barcode reader stopped.")
+             self.status = f"Stopped {self.port}"
+ def bc_callback(*args):
+@@ -82,13 +92,16 @@
+     logging.basicConfig(format="%(levelname)s:%(asctime)s - %(message)s", level=logging.DEBUG)
+     logging.info("Starting barcode reader...")
+     bc_reader = BarcodeReader(port='/dev/ttyACM0',baudrate=9600,callback=bc_callback, bounce=5)
++    bc_reader.start()
+     print(bc_reader.status)
+-    running = bc_reader.running
+-    while running:
+-        print('.', end='', flush=True)  # Print a dot to indicate the listener is running
+-        bc_reader.next()
+-        time.sleep(1)
+-    bc_reader.stop()
++    try:
++        while bc_reader.running:
++            bc_reader.next()
++            time.sleep(0.1)
++    except KeyboardInterrupt:
++        pass
++    finally:
++        bc_reader.stop()
+ 
+ if __name__ == '__main__':
+     try:
+--- /dev/null
++++ after/kiosk_boot_config.py
+@@ -0,0 +1,93 @@
++#!/usr/bin/env python3
++"""Idempotent, backed-up edits used by the Raspberry Pi setup wrappers."""
++import argparse
++from datetime import datetime
++import os
++from pathlib import Path
++import shutil
++import stat
++import tempfile
++
++PARAMETERS = ('video=DSI-1:panel_orientation=right_side_up', 'fbcon=rotate:1', 'consoleblank=0')
++
++
++def update_file(path, text):
++    path = Path(path).resolve()
++    original = path.read_text(encoding='utf-8')
++    if original == text:
++        print(f'Already configured: {path}')
++        return
++    backup = path.with_name(path.name + datetime.now().strftime('.%Y%m%d-%H%M%S-%f.bak'))
++    shutil.copy2(path, backup)
++    metadata = path.stat()
++    temporary = None
++    try:
++        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
++                                         prefix='.' + path.name + '.', delete=False) as stream:
++            temporary = stream.name
++            stream.write(text)
++            stream.flush()
++            os.fsync(stream.fileno())
++        os.chmod(temporary, stat.S_IMODE(metadata.st_mode))
++        if os.geteuid() == 0:
++            os.chown(temporary, metadata.st_uid, metadata.st_gid)
++        os.replace(temporary, path)
++    finally:
++        if temporary and os.path.exists(temporary):
++            os.unlink(temporary)
++    print(f'Updated: {path}; backup: {backup}')
++
++
++def cmdline_text(path):
++    lines = Path(path).read_text(encoding='utf-8').splitlines()
++    if len(lines) != 1 or not lines[0].strip():
++        raise ValueError('Kernel command line must contain one nonempty line')
++    # Other monitors may have their own video= options; preserve those.
++    tokens = [token for token in lines[0].split()
++              if not token.startswith(('video=DSI-1:', 'fbcon=', 'consoleblank='))]
++    return ' '.join(tokens + list(PARAMETERS)) + '\n'
++
++
++def config_text(path, replace_kms=False):
++    lines = Path(path).read_text(encoding='utf-8').splitlines()
++    overlay = 'dtoverlay=vc4-kms-dsi-7inch'
++    has_overlay = any(line.strip() == overlay for line in lines)
++    output = []
++    found = False
++    for line in lines:
++        if line.strip() == 'dtoverlay=vc4-kms-v3d':
++            found = True
++            if not replace_kms:
++                output.append(line)
++            if not has_overlay:
++                output.append(overlay)
++                has_overlay = True
++        else:
++            output.append(line)
++    if not found and not has_overlay:
++        raise ValueError('Target dtoverlay line not found in config file')
++    return '\n'.join(output) + '\n'
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('kind', choices=('cmdline', 'config', 'legacy'))
++    parser.add_argument('path')
++    parser.add_argument('--cmdline', default='/boot/firmware/cmdline.txt')
++    args = parser.parse_args()
++    try:
++        if args.kind == 'cmdline':
++            update_file(args.path, cmdline_text(args.path))
++        else:
++            # Compute both edits before changing either file.
++            text = config_text(args.path, replace_kms=args.kind == 'legacy')
++            cmdline = cmdline_text(args.cmdline) if args.kind == 'legacy' else None
++            update_file(args.path, text)
++            if cmdline is not None:
++                update_file(args.cmdline, cmdline)
++    except (OSError, ValueError) as exc:
++        parser.exit(1, f'Error: {exc}\n')
++
++
++if __name__ == '__main__':
++    main()
+--- /dev/null
++++ after/kiosk_clear_print_jobs.py
+@@ -0,0 +1,123 @@
++#!/usr/bin/env python3
++"""Remove old CUPS spool jobs before the scheduler starts, once per boot.
++
++Do not run against a live scheduler. Printer definitions, PPDs, and printer
++caches are retained. Test pages submitted after this service finishes survive
++later kiosk/CUPS service restarts because the systemd unit remains active.
++"""
++import argparse
++import logging
++import os
++from pathlib import Path
++import re
++import shlex
++import stat
++import tempfile
++
++JOB_FILE = re.compile(r'(?:c[0-9]{5,}|d[0-9]{5,}-[0-9]{3,})(?:\.[NO])?')
++CACHE_FILES = ('job.cache', 'job.cache.O', 'job.cache.N')
++
++
++def cups_directories(config_path):
++    directories = {'requestroot': Path('/var/spool/cups'), 'cachedir': Path('/var/cache/cups')}
++    for line in Path(config_path).read_text(encoding='utf-8').splitlines():
++        fields = shlex.split(line, comments=True)
++        if fields and fields[0].lower() in directories:
++            if len(fields) != 2 or not Path(fields[1]).is_absolute():
++                raise ValueError(f'Invalid {fields[0]} in {config_path}')
++            directories[fields[0].lower()] = Path(fields[1])
++    return directories['requestroot'], directories['cachedir']
++
++
++def scheduler_running(proc_root=Path('/proc')):
++    for path in proc_root.glob('[0-9]*/comm'):
++        try:
++            if path.read_text().strip() == 'cupsd':
++                return True
++        except FileNotFoundError:
++            continue  # The process exited during enumeration.
++    return False
++
++
++def regular_file(path):
++    # Refuse links and directories rather than following a spool entry elsewhere.
++    return stat.S_ISREG(path.lstat().st_mode)
++
++
++def empty_job_cache(path, next_job_id):
++    """Keep monotonically increasing job IDs without retaining queued jobs."""
++    metadata = path.stat()
++    temporary = None
++    try:
++        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
++                                         prefix='.kiosk-job-cache-', delete=False) as stream:
++            temporary = stream.name
++            stream.write(f'# Jobs cleared at boot by kiosk\nNextJobId {next_job_id}\n')
++            stream.flush()
++            os.fsync(stream.fileno())
++        os.chmod(temporary, stat.S_IMODE(metadata.st_mode))
++        if os.geteuid() == 0:
++            os.chown(temporary, metadata.st_uid, metadata.st_gid)
++        os.replace(temporary, path)
++    finally:
++        if temporary and os.path.exists(temporary):
++            os.unlink(temporary)
++
++
++def clear_spool(spool_dir, cache_dir, dry_run=False):
++    spool_dir, cache_dir = Path(spool_dir), Path(cache_dir)
++    # Validate all targets before removing any files. CUPS must be stopped.
++    jobs = []
++    if spool_dir.exists():
++        for path in spool_dir.iterdir():
++            if JOB_FILE.fullmatch(path.name):
++                if not regular_file(path):
++                    raise ValueError(f'Refusing nonregular job file: {path}')
++                jobs.append(path)
++    caches = []
++    next_job_id = 1
++    for filename in CACHE_FILES:
++        path = cache_dir / filename
++        if path.exists() or path.is_symlink():
++            if not regular_file(path):
++                raise ValueError(f'Refusing nonregular job cache: {path}')
++            caches.append(path)
++            for line in path.read_text(encoding='utf-8').splitlines():
++                match = re.fullmatch(r'\s*NextJobId\s+([0-9]+)\s*', line)
++                if match:
++                    next_job_id = max(next_job_id, int(match[1]))
++    for path in jobs:
++        job_id = int(re.match(r'[cd]([0-9]+)', path.name)[1])
++        next_job_id = max(next_job_id, job_id + 1)
++    if dry_run:
++        logging.info('Dry run: %d job files and %d job caches would be cleared', len(jobs), len(caches))
++        return len(jobs)
++    for path in jobs:
++        path.unlink()
++    # Empty both normal and recovery caches so old jobs cannot be restored.
++    for path in caches:
++        empty_job_cache(path, next_job_id)
++    logging.info('Cleared %d previous print-job files; next job ID %d', len(jobs), next_job_id)
++    return len(jobs)
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--cups-files', default='/etc/cups/cups-files.conf')
++    parser.add_argument('--dry-run', action='store_true')
++    args = parser.parse_args()
++    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
++    try:
++        if not args.dry_run:
++            if os.geteuid() != 0:
++                raise PermissionError('Boot cleanup must run as root')
++            if scheduler_running():
++                raise RuntimeError('CUPS is running; refusing to modify its spool')
++        spool, cache = cups_directories(args.cups_files)
++        clear_spool(spool, cache, dry_run=args.dry_run)
++    except (OSError, ValueError, RuntimeError) as exc:
++        parser.exit(1, f'Print-job cleanup failed: {exc}\n')
++
++
++if __name__ == '__main__':
++    main()
+--- before/kiosk_config.py
++++ after/kiosk_config.py
+@@ -3,6 +3,9 @@
+ import logging
+ import os
+ import ast
++import re
++from datetime import datetime
++from pathlib import Path
+ 
+ def read_config(filename):
+     '''
+@@ -15,18 +18,19 @@
+         # User interface settings
+         'languages': ['LAT','ENG','RUS'],
+         'default_language_index': 0,  # Default language index
++        'bg_image': 'white_background.png',
+         'assets_loader': 'assets', # Path to assets directory, relative to the script
+         'font': ('DejaVu Sans Mono',50), # Font used in the interface
+         'button_debounce_time_ms': 1000, # Time in milliseconds to debounce button presses
+-        'button_reset_to default_time_ms': 10*1000, # Time in milliseconds to activate default button after last press
++        'button_reset_to_default_time_ms': 10*1000, # Time in milliseconds to activate default button after last press
+         #Settings for display brighetness 0 - 255
+         'screen_brightness_active': 255,
+         'screen_brightness_normal': 100,
+         'screen_brightness_inactive': 50,
+-        'working_hours': [7,19],
++        'working_hours': ['7:30', '19:00'],
+         'working_days': [0,1,2,3,4],
+         'screen_brightness_to_min': 30,
+-        'screen_brightness_path': "/sys/class/backlight/rpi_backlight/brightness",
++        'screen_brightness_path': "/sys/class/backlight",
+         'screen_dpms_timeout_secs': 300,
+         #Settings for button frame size
+         'button_frame_height': 500,
+@@ -42,7 +46,7 @@
+         'animated_icon_height': 100,
+         'animated_icon_width': 100,
+         'animated_icon_delay': 100,
+-        'animated_icon_sys': 'sloading.gif',
++        'animated_icon_sys': 'loading.gif',
+         'animated_icon_prn': 'printer.gif',
+         'animated_icon_bc': 'barcode.gif',
+         'animated_icon_ok': 'verified.gif',
+@@ -61,7 +65,7 @@
+         'bc_reader_boudrate' : 9600,
+         'bc_reader_port' : '/dev/ttyACM0',
+         'bc_timeout' : .5,
+-        'bc_regex' : '^\d{7,9}#\d{4,5}',
++        'bc_regex' : r'^\d{7,9}#\d{4,5}',
+ 
+         #Host settings
+         'host' : '10.100.50.104',
+@@ -74,94 +78,140 @@
+         #printers':  {"HP": "HP LaserJet Series PCL 6 CUPS"},
+         'include_schemes' : ['usb','driverless'],
+         'printers' : {"HP": "HP LaserJet Series PCL 6 CUPS"},
++        'button_printer_reset': [1],
+         'watchdog_device' : None
+     }
+     if not os.path.isfile(filename):
+         logging.critical("Config file {} does not exist!".format(filename))
+         return(None)
+     
+-    cf = configparser.ConfigParser(allow_no_value=True,
+-                                converters={'list'  : lambda x: list(int(item) if item.isdigit() else item for item in x.split(',')),
+-                                            'tuple' : lambda x: tuple(int(item) if item.isdigit() else item for item in x.split(',')),
+-                                            'none'  : lambda x: None if x == 'None' else x,
+-                                            'dict'  : lambda x: ast.literal_eval(''.join(['{',x,'}']))
+-                                            },)
+-    cf.read(filename)
+-    #Tuple containing load commands
+-    commands =(
+-        "kiosk_config['log_file'] = cf.getnone('INTERFACE','log_file')",
+-        "kiosk_config['log_level'] = cf.get('INTERFACE','log_level')",
+-        "kiosk_config['languages'] = cf.getlist('INTERFACE','languages')",
+-        "kiosk_config['assets_loader'] = cf.get('INTERFACE','assets_loader')",
+-        "kiosk_config['bg_image'] = cf.get('INTERFACE','bg_image')",
+-        "kiosk_config['font'] = cf.gettuple('INTERFACE','font')",
+-        "kiosk_config['button_debounce_time_ms'] = cf.getint('INTERFACE','button_debounce_time_ms')",
+-        "kiosk_config['button_reset_to_default_time_ms'] = cf.getint('INTERFACE','button_reset_to_default_time_ms')",
+-        "kiosk_config['default_language_index'] = cf.getint('INTERFACE','default_language_index')",
+-        "kiosk_config['screen_brightness_active'] = cf.getint('INTERFACE','screen_brightness_active')",
+-        "kiosk_config['screen_brightness_normal'] = cf.getint('INTERFACE','screen_brightness_normal')",
+-        "kiosk_config['screen_brightness_inactive'] = cf.getint('INTERFACE','screen_brightness_inactive')",
+-        "kiosk_config['working_hours'] = cf.getlist('INTERFACE','working_hours')",
+-        "kiosk_config['working_days'] = cf.gettuple('INTERFACE','working_days')",
+-        "kiosk_config['screen_brightness_to_min'] = cf.getint('INTERFACE','screen_brightness_to_min')",
+-        "kiosk_config['screen_brightness_path'] = cf.get('INTERFACE','screen_brightness_path')",
+-        "kiosk_config['screen_dpms_timeout_secs'] = cf.getint('INTERFACE','screen_dpms_timeout_secs')",
+-
+-        "kiosk_config['screen_width'] = cf.getint('INTERFACE','screen_width')",
+-        "kiosk_config['screen_height'] = cf.getint('INTERFACE','screen_height')",
+-
+-        "kiosk_config['animated_icon_height'] = cf.getint('INTERFACE', 'animated_icon_height')",
+-        "kiosk_config['animated_icon_width'] = cf.getint('INTERFACE', 'animated_icon_width')",
+-        "kiosk_config['animated_icon_delay'] = cf.getint('INTERFACE', 'animated_icon_delay')",
+-
+-        "kiosk_config['animated_icon_sys'] = cf.get('INTERFACE', 'animated_icon_sys')",
+-        "kiosk_config['animated_icon_prn'] = cf.get('INTERFACE', 'animated_icon_prn')",
+-        "kiosk_config['animated_icon_bc'] = cf.get('INTERFACE', 'animated_icon_bc')",
+-        "kiosk_config['animated_icon_ok'] = cf.get('INTERFACE', 'animated_icon_ok')",
+-        "kiosk_config['animated_icon_not_ok'] = cf.get('INTERFACE', 'animated_icon_not_ok')",
+-        "kiosk_config['animated_icon_no_data'] = cf.get('INTERFACE', 'animated_icon_no_data')",
+-        "kiosk_config['animated_icon_in_progress'] = cf.get('INTERFACE', 'animated_icon_in_progress')",
+-        "kiosk_config['animated_icon_net'] = cf.get('INTERFACE', 'animated_icon_net')",
+-
+-        "kiosk_config['text_label_font_size'] = cf.getint('INTERFACE', 'text_label_font_size')",
+-        "kiosk_config['text_label_font'] = cf.get('INTERFACE', 'text_label_font')",
+-
+-        "kiosk_config['button_frame_height'] = cf.getint('INTERFACE','button_frame_height')",
+-        "kiosk_config['button_frame_width'] = cf.getint('INTERFACE','button_frame_width')",
+-        "kiosk_config['button_frame_posXY'] = cf.getlist('INTERFACE','button_frame_posXY')",
+-        "kiosk_config['popup_display_time'] = cf.getint('INTERFACE','popup_display_time')",
+-
+-        "kiosk_config['bc_reader_bounce'] = cf.getint('BARCODE','bc_reader_bounce')",
+-        "kiosk_config['bc_reader_boudrate'] = cf.getint('BARCODE','bc_reader_boudrate')",
+-        "kiosk_config['bc_reader_port'] = cf.get('BARCODE','bc_reader_port')",
+-        "kiosk_config['bc_timeout'] = cf.getfloat('BARCODE','bc_timeout')",
+-        "kiosk_config['bc_regex'] = r'{}'.format(cf.get('BARCODE','bc_regex'))",
+-
+-        "kiosk_config['host'] = cf.get('REPORT','host')",
+-        "kiosk_config['httpreq_timeout'] = cf.getint('REPORT','httpreq_timeout')",
+-        "kiosk_config['report_delay'] = cf.getint('REPORT','report_delay')",
+-        "kiosk_config['url'] = cf.get('REPORT','url')",
+-        "kiosk_config['url_test'] = cf.get('REPORT','url_test')",
+-        "kiosk_config['printers'] = cf.getdict('REPORT','printers')",
+-        "kiosk_config['button_printer_reset'] = cf.getlist('REPORT','button_printer_reset')",
+-        "kiosk_config['include_schemes'] = cf.getlist('REPORT','include_schemes')",
+-        "kiosk_config['report_not_ready_msg'] = cf.getlist('REPORT','report_not_ready_msg')",
+-        "kiosk_config['report_num_pages'] = cf.getlist('REPORT','report_num_pages')",
+-        "kiosk_config['watchdog_device'] = cf.getnone('WATCHDOG','watchdog_device')"
+-        )
+-    
+-
+-    for c in commands:
+-        try:
+-            #print('Executing: {}'.format(c))
+-            exec(c)
+-        except configparser.Error as e:
+-            logging.error(e)
+- 
+-    return(kiosk_config)
++    def sequence(value):
++        if not value.strip():
++            return []
++        return [int(item) if item.isdigit() else item
++                for item in (part.strip() for part in value.split(','))]
++
++    cf = configparser.ConfigParser(interpolation=None, converters={
++        'list': sequence,
++        'tuple': lambda value: tuple(sequence(value)),
++        'none': lambda value: None if value.strip().lower() in ('none', '') else value,
++        'dict': lambda value: ast.literal_eval('{' + value + '}'),
++    })
++    settings = (
++        ('log_file', 'getnone', 'INTERFACE', 'log_file'),
++        ('log_level', 'get', 'INTERFACE', 'log_level'),
++        ('languages', 'getlist', 'INTERFACE', 'languages'),
++        ('assets_loader', 'get', 'INTERFACE', 'assets_loader'),
++        ('bg_image', 'get', 'INTERFACE', 'bg_image'),
++        ('font', 'gettuple', 'INTERFACE', 'font'),
++        ('button_debounce_time_ms', 'getint', 'INTERFACE', 'button_debounce_time_ms'),
++        ('button_reset_to_default_time_ms', 'getint', 'INTERFACE', 'button_reset_to_default_time_ms'),
++        ('default_language_index', 'getint', 'INTERFACE', 'default_language_index'),
++        ('screen_brightness_active', 'getint', 'INTERFACE', 'screen_brightness_active'),
++        ('screen_brightness_normal', 'getint', 'INTERFACE', 'screen_brightness_normal'),
++        ('screen_brightness_inactive', 'getint', 'INTERFACE', 'screen_brightness_inactive'),
++        ('working_hours', 'getlist', 'INTERFACE', 'working_hours'),
++        ('working_days', 'gettuple', 'INTERFACE', 'working_days'),
++        ('screen_brightness_to_min', 'getint', 'INTERFACE', 'screen_brightness_to_min'),
++        ('screen_brightness_path', 'get', 'INTERFACE', 'screen_brightness_path'),
++        ('screen_dpms_timeout_secs', 'getint', 'INTERFACE', 'screen_dpms_timeout_secs'),
++        ('screen_width', 'getint', 'INTERFACE', 'screen_width'),
++        ('screen_height', 'getint', 'INTERFACE', 'screen_height'),
++        ('animated_icon_height', 'getint', 'INTERFACE', 'animated_icon_height'),
++        ('animated_icon_width', 'getint', 'INTERFACE', 'animated_icon_width'),
++        ('animated_icon_delay', 'getint', 'INTERFACE', 'animated_icon_delay'),
++        ('animated_icon_sys', 'get', 'INTERFACE', 'animated_icon_sys'),
++        ('animated_icon_prn', 'get', 'INTERFACE', 'animated_icon_prn'),
++        ('animated_icon_bc', 'get', 'INTERFACE', 'animated_icon_bc'),
++        ('animated_icon_ok', 'get', 'INTERFACE', 'animated_icon_ok'),
++        ('animated_icon_not_ok', 'get', 'INTERFACE', 'animated_icon_not_ok'),
++        ('animated_icon_no_data', 'get', 'INTERFACE', 'animated_icon_no_data'),
++        ('animated_icon_in_progress', 'get', 'INTERFACE', 'animated_icon_in_progress'),
++        ('animated_icon_net', 'get', 'INTERFACE', 'animated_icon_net'),
++        ('text_label_font_size', 'getint', 'INTERFACE', 'text_label_font_size'),
++        ('text_label_font', 'get', 'INTERFACE', 'text_label_font'),
++        ('button_frame_height', 'getint', 'INTERFACE', 'button_frame_height'),
++        ('button_frame_width', 'getint', 'INTERFACE', 'button_frame_width'),
++        ('button_frame_posXY', 'getlist', 'INTERFACE', 'button_frame_posXY'),
++        ('popup_display_time', 'getint', 'INTERFACE', 'popup_display_time'),
++        ('bc_reader_bounce', 'getint', 'BARCODE', 'bc_reader_bounce'),
++        ('bc_reader_boudrate', 'getint', 'BARCODE', 'bc_reader_boudrate'),
++        ('bc_reader_port', 'get', 'BARCODE', 'bc_reader_port'),
++        ('bc_timeout', 'getfloat', 'BARCODE', 'bc_timeout'),
++        ('host', 'get', 'REPORT', 'host'),
++        ('httpreq_timeout', 'getint', 'REPORT', 'httpreq_timeout'),
++        ('report_delay', 'getint', 'REPORT', 'report_delay'),
++        ('url', 'get', 'REPORT', 'url'),
++        ('url_test', 'get', 'REPORT', 'url_test'),
++        ('printers', 'getdict', 'REPORT', 'printers'),
++        ('button_printer_reset', 'getlist', 'REPORT', 'button_printer_reset'),
++        ('include_schemes', 'getlist', 'REPORT', 'include_schemes'),
++        ('report_not_ready_msg', 'getlist', 'REPORT', 'report_not_ready_msg'),
++        ('report_num_pages', 'getlist', 'REPORT', 'report_num_pages'),
++        ('watchdog_device', 'getnone', 'WATCHDOG', 'watchdog_device'),
++        ('bc_regex', 'get', 'BARCODE', 'bc_regex'),
++    )
++    try:
++        with open(filename, encoding='utf-8') as stream:
++            cf.read_file(stream)
++        for key, getter, section, option in settings:
++            if cf.has_option(section, option):
++                kiosk_config[key] = getattr(cf, getter)(section, option)
++        validate_config(kiosk_config)
++    except (OSError, configparser.Error, ValueError, TypeError, SyntaxError, re.error) as exc:
++        logging.error("Invalid configuration %s: %s", filename, exc)
++        return None
++
++    base = Path(filename).resolve().parent
++    for key in ('assets_loader', 'log_file'):
++        if kiosk_config[key] is not None:
++            kiosk_config[key] = str(base / kiosk_config[key])
++    return kiosk_config
++
++
++def validate_config(config):
++    languages = config['languages']
++    if not languages or any(not isinstance(value, str) or not value for value in languages):
++        raise ValueError('languages must be a nonempty list of names')
++    if not 0 <= config['default_language_index'] < len(languages):
++        raise ValueError('default_language_index is out of range')
++    for key in ('report_not_ready_msg', 'report_num_pages'):
++        if len(config[key]) != len(languages) or any(not isinstance(v, str) for v in config[key]):
++            raise ValueError(f'{key} must contain one string per language')
++    if len(config['working_hours']) != 2:
++        raise ValueError('working_hours must contain start and end times')
++    for value in config['working_hours']:
++        datetime.strptime(value, '%H:%M')
++    if any(day not in range(7) for day in config['working_days']):
++        raise ValueError('working_days must contain numbers from 0 to 6')
++    if len(config['button_frame_posXY']) != 2 or any(not isinstance(v, int) for v in config['button_frame_posXY']):
++        raise ValueError('button_frame_posXY must contain two integers')
++    for key in ('screen_width', 'screen_height', 'button_frame_width', 'button_frame_height',
++                'animated_icon_width', 'animated_icon_height', 'animated_icon_delay',
++                'button_reset_to_default_time_ms', 'httpreq_timeout', 'bc_timeout', 'bc_reader_boudrate',
++                'popup_display_time', 'text_label_font_size'):
++        if config[key] <= 0:
++            raise ValueError(f'{key} must be positive')
++    for key in ('button_debounce_time_ms', 'report_delay', 'bc_reader_bounce',
++                'screen_dpms_timeout_secs', 'screen_brightness_to_min'):
++        if config[key] < 0:
++            raise ValueError(f'{key} cannot be negative')
++    for key in ('screen_brightness_active', 'screen_brightness_normal', 'screen_brightness_inactive'):
++        if not 0 <= config[key] <= 255:
++            raise ValueError(f'{key} must be between 0 and 255')
++    if not isinstance(config['printers'], dict) or any(
++        not isinstance(k, str) or not isinstance(v, str) or not k or not v
++        for k, v in config['printers'].items()
++    ):
++        raise ValueError('printers must map manufacturer names to PPD models')
++    if config['log_level'].upper() not in ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'):
++        raise ValueError('invalid log_level')
++    if any(not isinstance(i, int) or not 0 <= i < len(languages) for i in config['button_printer_reset']):
++        raise ValueError('button_printer_reset contains an invalid language index')
++    re.compile(config['bc_regex'])
+ 
+ def main():
+-    f = os.path.join(os.getcwd(),'kiosk.ini')
++    f = str(Path(__file__).with_name('kiosk.ini'))
+     logging.basicConfig(format='%(levelname)s:%(asctime)s - %(message)s', level=logging.DEBUG)
+     cfg = read_config(f)
+     print(cfg)
+--- before/kiosk_main.py
++++ after/kiosk_main.py
+@@ -6,9 +6,10 @@
+ import os, sys
+ import logging
+ import argparse
++import signal
+ 
+ import threading
+-from queue import Queue
++from queue import Queue, Empty
+ import time
+ 
+ import kiosk_config
+@@ -24,8 +25,6 @@
+ # Polling interval for checking messages on service thread
+ # and BC reader timeout
+ polling_int = 0.5
+-import logging
+-
+ logging.basicConfig(format='%(levelname)s:%(asctime)s - %(message)s')
+ logger = logging.getLogger()
+ 
+@@ -51,8 +50,8 @@
+         self.idle()
+         
+     def idle(self):
+-        self.configure(state="normal",
+-                       border_color="#008ca4",
++        self.active = False
++        self.configure(border_color="#008ca4",
+                        fg_color=("white","#008ca4"),
+                        text_color= ("#008ca4","white"),
+                        bg_color="transparent")
+@@ -89,12 +88,13 @@
+         self.height = height
+         self.posXY = posXY
+         self.buttons = list()
++        self._debounce_after = None
+         self.selected_button = config['default_language_index']
+         self.queue_from_gui = queue_from_gui
+         self._default_bttn_after = None
+         self.init_buttons()
+         self.enable_buttons(self.selected_button)
+-        self._default_bttn_after = self.after(config['button_reset_to_default_time_ms'], self.set_to_default_bttn)
++        self._default_bttn_after = self.after(self.config['button_reset_to_default_time_ms'], self.set_to_default_bttn)
+           
+     def init_buttons(self):
+         for lang in enumerate(self.config['languages']):
+@@ -107,7 +107,7 @@
+     
+     def debounce_buttons(self, debounce_time:int):
+         self.disable_buttons()
+-        self.after(debounce_time, self.enable_buttons())
++        self.after(debounce_time, self.enable_buttons, self.selected_button)
+         logger.debug('bttns_debounce')
+ 
+     def disable_buttons(self, active_button_index:int = None):
+@@ -117,7 +117,7 @@
+             if idx == active_button_index:
+                 button.pressed()
+                 msg = (active_button_index, self.config["languages"][active_button_index])
+-                queue_from_gui.put(msg)
++                self.queue_from_gui.put(msg)
+             else:
+                 button.idle()
+ 
+@@ -127,6 +127,7 @@
+             button.active = False
+ 
+     def enable_buttons(self,active_button_index:int):
++        self._debounce_after = None
+         logger.debug('bttns_enabled, act: {}'.format(active_button_index))
+         for idx, button in enumerate(self.buttons):
+             button.state_normal()
+@@ -137,10 +138,13 @@
+ 
+     def set_to_default_bttn(self):
+         logger.info('setting to default button: {}'.format(self.config['default_language_index']))
++        if self._debounce_after is not None:
++            self.after_cancel(self._debounce_after)
++            self._debounce_after = None
+         if self.selected_button != self.config['default_language_index']:
+             self.selected_button = self.config['default_language_index']
+             self.disable_buttons(self.config['default_language_index'])
+-            self.enable_buttons(self.config['default_language_index'])
++        self.enable_buttons(self.selected_button)
+         # Set screen backlight to normal or low, depending on working hours, enable/disable screen powersave
+         logger.debug('Checking working time for setting brightness and powersave')
+         if kiosk_utils.is_working_time(start=self.config['working_hours'][0], end=self.config['working_hours'][1], workdays=self.config['working_days'],):
+@@ -162,7 +166,7 @@
+         if self._default_bttn_after:
+             self.after_cancel(self._default_bttn_after)
+         # Set new
+-        self._default_bttn_after = self.after(config['button_reset_to_default_time_ms'], self.set_to_default_bttn)
++        self._default_bttn_after = self.after(self.config['button_reset_to_default_time_ms'], self.set_to_default_bttn)
+         
+     def on_click(self, lang):
+         logger.debug('bttns_sel: {}'.format(lang))
+@@ -173,14 +177,15 @@
+             kiosk_utils.set_screen_dpms(0)
+             self.winfo_toplevel()._display_dpms = 0
+             logger.debug('Set display dpms to {}'.format(self.winfo_toplevel()._display_dpms))
+-            return()
+         #Debounce
++        if self._debounce_after is not None:
++            self.after_cancel(self._debounce_after)
+         self.disable_buttons(self.selected_button)
+-        self.after(self.config['button_debounce_time_ms'], self.enable_buttons, self.selected_button)
++        self._debounce_after = self.after(self.config['button_debounce_time_ms'], self.enable_buttons, self.selected_button)
+         if self._default_bttn_after:
+             self.after_cancel(self._default_bttn_after)
+ 
+-        self._default_bttn_after = self.after(config['button_reset_to_default_time_ms'], self.set_to_default_bttn)
++        self._default_bttn_after = self.after(self.config['button_reset_to_default_time_ms'], self.set_to_default_bttn)
+ 
+ class PopupFrame(ctk.CTkFrame):
+     def __init__(self, master=None, config: dict = config):
+@@ -198,7 +203,7 @@
+         self.label = ctk.CTkLabel(
+             self,
+             textvariable=self._message_value,
+-            font=("DejaVu Sans Mono", 20),
++            font=(config["text_label_font"], config["text_label_font_size"]),
+             justify=tk.LEFT,
+             padx=0,
+             pady=0,)
+@@ -224,22 +229,23 @@
+                 kiosk_utils.TicketPurpose.PRG: self._config["animated_icon_in_progress"],
+                 kiosk_utils.TicketPurpose.INC: self._config["animated_icon_no_data"],
+             }
+-            gif_path = os.path.join(self._config["assets_loader"], gif_map[ticket.ticket_type])
++            gif_path = os.path.join(self._config["assets_loader"], gif_map.get(ticket.ticket_type, self._config["animated_icon_not_ok"]))
+             self.icon = AnimatedGifLabelAcc(
+                 self,
+                 gif_path=gif_path,
+-                delay=config["animated_icon_delay"],
+-                width=config["animated_icon_width"],
+-                height=config["animated_icon_height"],
++                delay=self._config["animated_icon_delay"],
++                width=self._config["animated_icon_width"],
++                height=self._config["animated_icon_height"],
+                 img_cache=img_cache,
+             )
++        self._prev_ticket_type = ticket.ticket_type
+         # show icon
+         self.icon.pack(side=tk.BOTTOM, padx=0, pady=40)
+         self.icon.start_animation(ticket.ticket_animate_cycles)
+ 
+ class KioskPopup(ctk.CTkToplevel):
+     """A custom popup class that inherits from CTkToplevel."""
+-    def __init__(self, **kwargs):
++    def __init__(self, config, **kwargs):
+         super().__init__(**kwargs)
+         self.overrideredirect(True)
+         self.geometry(
+@@ -247,7 +253,7 @@
+                 config["button_frame_width"],
+                 config["button_frame_height"],
+                 config['button_frame_posXY'][0], config['button_frame_posXY'][1]))
+-        self.title = "KioskPopup"
++        self.title("KioskPopup")
+         self.attributes("-topmost", True)
+         self.time_created = time.time()
+         self.frame = PopupFrame(master=self, config=config)
+@@ -257,15 +263,17 @@
+         """Callback function for closing the popup."""
+         logger.debug("Closing popup")
+         self.destroy()
+-        self.update
+         
+ class KioskApp(ctk.CTk):
+     """Main application class that inherits from CTk."""
+-    def __init__(self, config=None, queue_to_gui: Queue = None, slave_thread:threading.Thread = None):
++    def __init__(self, config=None, queue_to_gui: Queue = None, slave_thread:threading.Thread = None, stop_event=None):
+         super().__init__()
+         self.queue_to_gui = queue_to_gui
+         self.config = config
+         self.slave_thread = slave_thread
++        self.stop_event = stop_event
++        self.worker_failed = False
++        self.protocol("WM_DELETE_WINDOW", self.quit_app)
+         self.bind('<Escape>', self.quit_app)     
+         self.bg_image = (
+             tk.PhotoImage(
+@@ -312,21 +320,43 @@
+         )
+         self.check_queue()
+     
+-    def quit_app(self,evt):
+-        print('\nExit requested by user')
++    def quit_app(self,evt=None):
++        logger.info('Kiosk exit requested')
++        if self.stop_event is not None:
++            self.stop_event.set()
+         if self._wd is not None:
+-            print('V',file = self._wd, flush = True)
++            try:
++                print('V', file=self._wd, flush=True)
++            except OSError as exc:
++                logger.error('Watchdog stop failed: %s', exc)
++            finally:
++                self._wd.close()
++                self._wd = None
+         self.destroy()
+     
+     def check_queue(self):
+         # print("^", end="", flush=True)  # heartbeat
++        if (self.slave_thread is not None and not self.slave_thread.is_alive()
++                and self.stop_event is not None and not self.stop_event.is_set()):
++            logger.error('Service worker stopped; exiting for systemd to restart the kiosk')
++            self.worker_failed = True
++            self.quit_app()
++            return
+         self.after(500, self.check_queue)
+-        if self._wd is not None and self.slave_thread.is_alive():
+-            print('1',file = self._wd, flush = True)
++        if self._wd is not None and self.slave_thread is not None and self.slave_thread.is_alive():
++            try:
++                print('1',file=self._wd, flush=True)
++            except OSError as exc:
++                logger.error('Watchdog write failed: %s', exc)
+ 
+         if self.popup_window and self.popup_window.winfo_exists():
+-            if not self.popup_window.frame.icon.stopped():
++            icon = self.popup_window.frame.icon
++            if time.monotonic() < self.popup_window.minimum_display_until:
+                 return
++            if icon is not None and not icon.stopped():
++                if time.monotonic() < self.popup_window.display_until:
++                    return
++                icon.stop_animation()
+         if not self.queue_to_gui.empty():
+             logger.debug('Exiting powersave or low brightness mode due to message in queue')
+             if self.winfo_toplevel()._display_dpms != 0:
+@@ -335,7 +365,10 @@
+                 logger.debug('Set display dpms off')
+             kiosk_utils.set_screen_dpms(0)
+             kiosk_utils.set_brightness(self.config['screen_brightness_normal'], self.config['screen_brightness_path'])
+-            ticket = self.queue_to_gui.get_nowait()
++            try:
++                ticket = self.queue_to_gui.get_nowait()
++            except Empty:
++                return
+             if not isinstance(ticket, kiosk_utils.Ticket):
+                 logger.error(f"Invalid message: {ticket}")
+                 return
+@@ -345,9 +378,12 @@
+                     self._close_popup()
+             else:
+                 if not self.popup_window or not self.popup_window.winfo_exists():
+-                    self.popup_window = KioskPopup(master=self)
++                    self.popup_window = KioskPopup(config=self.config, master=self)
+                 else:
+                     self.popup_window.deiconify()
++                self.popup_window.minimum_display_until = time.monotonic() + ticket.ticket_display_time / 1000
++                self.popup_window.display_until = time.monotonic() + (
++                    ticket.ticket_display_time or self.config['popup_display_time']) / 1000
+                 self.popup_window.frame.update(ticket=ticket)
+         else:
+             self._close_popup()
+@@ -367,17 +403,21 @@
+         type=str,
+         metavar="file",
+         help="Name config file. Default: kiosk.ini",
+-        default=os.path.join(os.getcwd(), "kiosk.ini"),
++        default=os.path.join(os.path.dirname(__file__), "kiosk.ini"),
+     )
+     args = parser.parse_args()
+     if not os.path.isfile(args.config):
+         print("Config file not found.")
+         sys.exit(1)
+-    config = kiosk_config.read_config(os.path.join(os.getcwd(),'kiosk.ini'))
+-
+-    logger.setLevel(os.environ.get("LOGLEVEL", config["log_level"]).upper())
+-
+-    img_cache = load_gif_frames(os.path.join(config["assets_loader"], "img_cache"))
++    config = kiosk_config.read_config(args.config)
++    if config is None:
++        sys.exit(1)
++
++    logging.basicConfig(format='%(levelname)s:%(asctime)s - %(message)s',
++                        level=os.environ.get('LOGLEVEL', config['log_level']).upper(),
++                        filename=config['log_file'], force=True)
++
++    img_cache = load_gif_frames(config["assets_loader"], config["animated_icon_width"], config["animated_icon_height"])
+     logger.debug("Finished loading image cache {}".format(len(img_cache)))
+ 
+     # Start service thread
+@@ -395,8 +435,14 @@
+     t1.start()
+     logger.info("Service_thread: {}".format(t1.is_alive()))
+ 
+-    kiosk_app = KioskApp(config:=config, queue_to_gui=queue_to_gui, slave_thread=t1)
+-    kiosk_app.mainloop()
++    try:
++        kiosk_app = KioskApp(config=config, queue_to_gui=queue_to_gui, slave_thread=t1, stop_event=th_ev)
++        signal.signal(signal.SIGTERM, lambda *_: kiosk_app.quit_app())
++        kiosk_app.mainloop()
++        return 1 if kiosk_app.worker_failed else 0
++    finally:
++        th_ev.set()
++        t1.join(timeout=2)
+ 
+ if __name__ == '__main__':
+-    main()
++    raise SystemExit(main())
+--- before/kiosk_report.py
++++ after/kiosk_report.py
+@@ -1,197 +1,164 @@
+ #!/usr/bin/env python3
++"""Download reports and manage the kiosk's CUPS printer."""
++import logging
++import os
++import tempfile
++
++import cups
+ import requests
+-import tempfile
+-import logging
+-import cups
+-import os
+-import kiosk_utils
+-from queue import Queue
+ 
+ import kiosk_config
++import kiosk_utils
+ 
+-def connect_to_cups() -> cups.Connection:
++CUPS_ERRORS = (cups.IPPError, RuntimeError, OSError)
++
++
++def connect_to_cups():
+     try:
+-        conn = cups.Connection()
+-        logging.debug('CUPS Connection established')
+-    except cups.IPPError as e:
+-        logging.error(f"Failed to connect to CUPS server: {e}")
+-        return(None)
+-    return(conn)
++        return cups.Connection()
++    except CUPS_ERRORS as exc:
++        logging.error('Failed to connect to CUPS: %s', exc)
++        return None
+ 
+-def check_default(ap,ip,dp) -> bool:
+-    '''
+-    Check if currend default printer is avilable
+-    '''
+-    for p_uri in ap.keys():
+-        if ip[dp]['device-uri'] == p_uri:
+-            return(True)
+-    return(False)
+ 
+-def add_printer(conn:cups.Connection = None,
+-                allowed_printers:dict = None,
+-                avilable_printers:dict = None) -> str:
+-    # Get parameters for new printer 
+-    params = dict
+-    # PPD
+-    n = None
+-    for k_al, v_al in allowed_printers.items():
+-        for k_pr, v_pr in avilable_printers.items():
+-            if v_pr['device-make-and-model'].startswith(k_al):
+-                n = v_al
+-                break
+-        if n is not None:
+-            break
++def check_default(available, installed, default):
++    return installed.get(default, {}).get('device-uri') in available
++
++
++def add_printer(conn=None, allowed_printers=None, avilable_printers=None):
++    """Return (success, queue name or error), including when no model matches."""
++    for make, model in (allowed_printers or {}).items():
++        for uri, device in (avilable_printers or {}).items():
++            if not device.get('device-make-and-model', '').startswith(make):
++                continue
++            try:
++                ppds = conn.getPPDs(ppd_make_and_model=model)
++                if not ppds:
++                    logging.warning('No PPD available for %s', model)
++                    continue
++                name = model.replace(' ', '_')
++                conn.addPrinter(name=name, ppdname=next(iter(ppds)),
++                                info=model, location='EGL', device=uri)
++                conn.acceptJobs(name)
++                conn.setPrinterShared(name, False)
++                conn.setDefault(name)
++                conn.enablePrinter(name)
++                return True, name
++            except CUPS_ERRORS as exc:
++                logging.error('Failed to install printer: %s', exc)
++                return False, str(exc)
++    return False, 'No supported printer and matching PPD found'
++
++
++def delete_printers(conn=None, printers=None):
++    """Delete explicitly supplied queues, or all queues for a manual reset."""
+     try:
+-        pn = conn.getPPDs(ppd_make_and_model = n)
+-    except cups.IPPError as e:
+-        logging.error(e)
+-        return(False, e)
++        if printers is None:
++            printers = conn.getPrinters()
++        for printer in printers:
++            conn.deletePrinter(printer)
++            logging.info('Deleted printer: %s', printer)
++        return True
++    except CUPS_ERRORS as exc:
++        logging.error('Failed to delete printers: %s', exc)
++        return False
+ 
+-    params = {'ppd_name': next(iter(pn)),
+-              'name' : n.replace(' ','_'),
+-              'info' : n,
+-              'location' : 'EGL',
+-              'device': k_pr
+-              }
+-    # Add printer
++
++def init_printer(conn=None, config=None, queue_to_gui=None):
++    def notify(message, purpose=kiosk_utils.TicketPurpose.PRN):
++        kiosk_utils.send_ticket(ticket_value=message, ticket_type=purpose,
++                                ticket_animate_cycles=1, queue_tx=queue_to_gui)
++    if conn is None:
++        return False
+     try:
+-        conn.addPrinter(name = params['name'], ppdname = params['ppd_name'],
+-                        info = params['info'], location = params['location'],
+-                        device = params['device'])
+-       #self.addPrinter(name=self.name, ppdname = ppd_name, info = printer_name, location = 'Local printer', device = self.uri)
+-    except cups.IPPError as e:
+-        logging.error(e)
+-        return(False, e)
+-    else:
+-        conn.acceptJobs(params['name'])
+-        conn.setPrinterShared(params['name'],False)
+-        conn.setDefault(params['name'])
+-        conn.enablePrinter(params['name'])
+-    return(True, params['name'])
++        available = conn.getDevices(include_schemes=config['include_schemes'])
++        if not available:
++            notify('No printers found\n' + ', '.join(config['include_schemes']))
++            return False
++        installed = conn.getPrinters()
++        default = conn.getDefault()
++        if default and check_default(available, installed, default):
++            conn.acceptJobs(default)
++            conn.enablePrinter(default)
++            notify(f'{default}\nOK')
++            return True
++        # Preserve other queues. Select an installed supported printer if possible.
++        for name, attrs in installed.items():
++            uri = attrs.get('device-uri')
++            model = available.get(uri, {}).get('device-make-and-model', '')
++            if uri in available and any(model.startswith(make) for make in config['printers']):
++                conn.setDefault(name)
++                conn.acceptJobs(name)
++                conn.enablePrinter(name)
++                notify(f'{name}\nOK')
++                return True
++        success, result = add_printer(conn, config['printers'], available)
++        if success:
++            notify(f'{result}\nprinter installed')
++            logging.info('Printer installed: %s', result)
++            return True
++        notify('Error installing printer\n' + result, kiosk_utils.TicketPurpose.ERR)
++    except CUPS_ERRORS as exc:
++        logging.error('Printer initialization failed: %s', exc)
++        notify('Printer initialization failed', kiosk_utils.TicketPurpose.ERR)
++    return False
+ 
+-def delete_printers(conn:cups.Connection = None, printers:dict = None):
+-    printers = conn.getPrinters()
+-    if printers:
+-        for printer in printers:
++
++def print_report(conn=None, tmp_file=None):
++    """Return a job ID after CUPS accepts the job; return None on failure.
++
++    The caller owns the report file and removes it after submission.
++    """
++    if conn is None:
++        conn = connect_to_cups()
++    if conn is None:
++        return None
++    try:
++        printers = conn.getPrinters()
++        printer = conn.getDefault()
++        if not printer or printer not in printers:
++            logging.error('No default printer available in CUPS')
++            return None
++        options = {'print-color-mode': 'monochrome'}
++        if tmp_file:
++            job_id = conn.printFile(printer, tmp_file, 'Kiosk report', options=options)
++        else:
++            job_id = conn.printTestPage(printer, options=options)
++        return job_id if job_id and job_id > 0 else None
++    except CUPS_ERRORS as exc:
++        logging.error('Report submission failed: %s', exc)
++        return None
++
++
++def get_report_from_host(url, timeout=10):
++    """Return [HTTP status, PDF path], or [None, None] for a failed request."""
++    path = None
++    try:
++        with requests.get(url, timeout=timeout) as response:
++            content_type = response.headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
++            if response.status_code != 200 or content_type != 'application/pdf':
++                return [response.status_code, None]
++            with tempfile.NamedTemporaryFile(prefix='kio_', suffix='.pdf', delete=False) as stream:
++                path = stream.name
++                stream.write(response.content)
++            return [response.status_code, path]
++    except (requests.RequestException, OSError) as exc:
++        # Request exception strings can include the report access token in the URL.
++        logging.error('Report download failed (%s)', type(exc).__name__)
++        if path:
+             try:
+-                conn.deletePrinter(printer)
+-                logging.info(f"Deleted printer: {printer}")
+-            except cups.IPPError as e:
+-                logging.error(f"Failed to delete printer {printer}: {e}")
++                os.unlink(path)
++            except OSError:
++                logging.warning('Cannot remove temporary report')
++        return [None, None]
+ 
+-def init_printer(conn:cups.Connection = None, config:dict = None, queue_to_gui:Queue = None):        
+-    avilable_printers = conn.getDevices(include_schemes = config['include_schemes'])
+-    # No printers detected - exiting
+-    if len(avilable_printers) == 0:
+-        kiosk_utils.send_ticket(ticket_value='No printers found\n {}'.format(list(config['include_schemes'])),
+-                        ticket_type=kiosk_utils.TicketPurpose.PRN,
+-                        ticket_animate_cycles = 3,
+-                        queue_tx = queue_to_gui)
+-        return(False)
+-    installed_printers = conn.getPrinters()
+-    default_printer = conn.getDefault()
+-    if default_printer:
+-        # Check if current default printer is avilable
+-        # if so, purge unfinished print jobs & exit
+-        if check_default(avilable_printers,installed_printers,default_printer):
+-            try:
+-                conn.cancelAllJobs(uri = installed_printers[default_printer]['device-uri'], purge_jobs = True)
+-            except cups.IPPError as e:
+-                logging.error(e)
+-            else:
+-                logging.info('Purge old print jobs OK')
+-            logging.debug('Def prn ok')
+-            kiosk_utils.send_ticket(ticket_value='{}\n OK'.format(default_printer),
+-                    ticket_type=kiosk_utils.TicketPurpose.PRN,
+-                    ticket_animate_cycles = 1,
+-                    queue_tx=queue_to_gui)
+-            return(True)
+-        # Default printer not avlilable
+-        default_printer = False
+-    delete_printers(conn=conn, printers = installed_printers)
+-    kiosk_utils.send_ticket(ticket_value='{} printer(s) found\n{}'.format(len(avilable_printers),
+-                                                                          '\n'.join([pr[:18] for pr in avilable_printers])),
+-                    ticket_type=kiosk_utils.TicketPurpose.PRN,
+-                    ticket_animate_cycles = 1,
+-                    queue_tx=queue_to_gui)
+-    if add_printer(conn = conn, allowed_printers=config['printers'],
+-                    avilable_printers=avilable_printers):
+-        default_printer = conn.getDefault()
+-        kiosk_utils.send_ticket(ticket_value='{}\nprinter installed'.format(default_printer),
+-                ticket_type=kiosk_utils.TicketPurpose.PRN,
+-                ticket_animate_cycles = 1,
+-                queue_tx=queue_to_gui)
+-        logging.info('Printer {} installed'.format(default_printer))
+-        conn.printTestPage(default_printer)
+-        os.system('sudo shutdown -r now')
+-                        
+-    else:
+-        kiosk_utils.send_ticket(ticket_value='Error installing printer',
+-            ticket_type=kiosk_utils.TicketPurpose.ERR,
+-            ticket_animate_cycles = 1,
+-            queue_tx=queue_to_gui)
+-        logging.info('Printer not added')            
+-    return
+-
+-def print_report(conn:cups.Connection = None, tmp_file:str = None) -> int:
+-    try:
+-        conn = cups.Connection()
+-    except cups.IPPError as e:
+-        logging.error(f"Failed to connect to CUPS server: {e}")
+-        return(False)
+-    printers = conn.getPrinters()
+-    if not printers:
+-        logging.error('No printers found in CUPS')
+-        return(None)
+-    printer = list(printers.keys())[0]  # Use the first available printer
+-    logging.info(f"Printing report on printer: {printer}")
+-    if tmp_file:
+-        job_id = conn.printFile(printer, tmp_file, "Test Report", options ={'print-color-mode': 'monochrome'})
+-        try:
+-            os.unlink(tmp_file)
+-        except FileNotFoundError as e:
+-            logging.error(e)
+-    else:
+-        job_id = conn.printTestPage(printer, options ={'print-color-mode': 'monochrome'}) 
+-    return(job_id)
+-
+-def get_report_from_host(url, timeout = 10) -> list:
+-    '''
+-    Gets testing report from server, saves it to temporary file
+-    Returns status and link to temporary file
+-    '''
+-    e = None
+-    try:
+-        rep = requests.get(url, timeout= timeout)
+-    except requests.exceptions.HTTPError:
+-        e = 'HTTP error'
+-    except requests.exceptions.ReadTimeout:
+-        e = 'Read timeout'
+-    except requests.exceptions.ConnectionError:
+-        e = 'Connection error'
+-    except requests.exceptions.RequestException:
+-        e = 'Exception request'
+-    except Exception:
+-        e = 'Unknown error'
+-    finally:
+-        if e:
+-            kiosk_utils.send_ticket(ticket_value=f'ERR: {e}',
+-                                    ticket_type=kiosk_utils.TicketPurpose.BC)
+-            return(None)     
+-    if rep.status_code == 200 and rep.headers.get('Content-Type') == 'application/pdf':
+-        #Create tmp file for CUPS
+-        temp_file = tempfile.NamedTemporaryFile(prefix='kio_',suffix='.pdf', delete=False,)
+-        #Write content to tmp file
+-        with open(temp_file.name, 'wb') as tf:
+-            tf.write(rep.content)
+-        return([rep.status_code, temp_file.name])
+-    return([rep.status_code, None])
+ 
+ def main():
+-    logging.basicConfig(format="%(levelname)s:%(asctime)s - %(message)s", level=logging.DEBUG)
+-    config = kiosk_config.read_config(os.path.join(os.getcwd(),'kiosk.ini'))
+-    init_printer(config=config)
++    logging.basicConfig(format='%(levelname)s:%(asctime)s - %(message)s', level=logging.DEBUG)
++    config = kiosk_config.read_config(os.path.join(os.path.dirname(__file__), 'kiosk.ini'))
++    if config is not None:
++        init_printer(conn=connect_to_cups(), config=config)
+ 
+-    
++
+ if __name__ == '__main__':
+     main()
+--- before/kiosk_service.py
++++ after/kiosk_service.py
+@@ -1,224 +1,203 @@
+-
++#!/usr/bin/env python3
++"""Background kiosk startup, barcode processing, and printer submission."""
+ import logging
++import os
++import re
++import subprocess
+ import threading
+-import os,re
+ import time
+-from queue import Queue
+-import cups
+-
++from pathlib import Path
++from queue import Empty
++from urllib.parse import quote, urlsplit
++
++import kiosk_report
+ import kiosk_utils
+ from kiosk_bcr import BarcodeReader
+-import kiosk_report
+-
+-config = dict()
+-polling_int = .5
+-lang = str()
+-
+-conn = None #cups.Connection object placeholder
+-
+-def proc_queue(msg, config=config):
+-    '''
+-    Process the message from the queue.
+-    '''
+-    logging.debug(f"Processing message: {msg}")
+-    kiosk_utils.speak_status(os.path.join(config['assets_loader'], 'lang_{}.wav'.format(msg[1])), background=True)
+-
+-def service_thread(th_ev: threading.Event, polling_int: float = 0.5,
+-                   config: dict = None, queue_from_gui: Queue = None, queue_to_gui: Queue = None):
++
++lang = None
++conn = None
++
++
++def drain_queue(queue):
++    while True:
++        try:
++            queue.get_nowait()
++        except Empty:
++            return
++
++
++def proc_queue(msg, config):
++    kiosk_utils.speak_status(os.path.join(config['assets_loader'], f'lang_{msg[1]}.wav'))
++
++
++def ethernet_speed():
++    try:
++        speed = int(Path('/sys/class/net/eth0/speed').read_text().strip())
++        return speed if speed > 0 else 'unknown'
++    except (OSError, ValueError):
++        return 'unknown'
++
++
++def service_thread(th_ev: threading.Event, polling_int=0.5, config=None,
++                   queue_from_gui=None, queue_to_gui=None):
+     global lang, conn
+-    time.sleep(1)
+-    
+-    lang = [config['default_language_index'], config['languages'][config['default_language_index']]]
+-    last_msg_time = time.time()
+-    conn = None
+-    queue_from_gui.queue.clear()  # Clear the queue to avoid processing old messages
+-    
+-    while conn is None:
+-        conn =  kiosk_report.connect_to_cups()
+-        if not conn:
+-            kiosk_utils.send_ticket(ticket_value = 
+-            'Error connecting to CUPS',
+-            ticket_type=kiosk_utils.TicketPurpose.ERR,
+-            ticket_animate_cycles = 1,
+-            queue_tx=queue_to_gui)
+-            time.sleep(5)
+-
+-    # Check for request to delete printers in CUPS
+-    kiosk_utils.speak_status(os.path.join(config['assets_loader'], 'attn.wav'), background=True)
+-    kiosk_utils.send_ticket(ticket_value='<{}> to reset printers'.format(config['languages'][1]),
+-                        ticket_type=kiosk_utils.TicketPurpose.PRN,
+-                        ticket_animate_cycles = 1,
+-                        queue_tx=queue_to_gui)
+-
+-    time.sleep(5)
+-    if not queue_from_gui.empty():
+-        msg = queue_from_gui.get_nowait()
+-        last_msg_time = time.time()
+-        if msg[0] == 1:
+-            logging.info(f"Printer reset request: {msg}")
+-            kiosk_report.delete_printers(conn=conn)
+-            kiosk_utils.send_ticket(ticket_value='Deleting all printers\non CUPS',
+-                    ticket_type=kiosk_utils.TicketPurpose.PRN,
+-                    ticket_animate_cycles = 1,
+-                    queue_tx=queue_to_gui)
+-            time.sleep(3)
+-            # Check for printers
+-    printer_ok = False
+-    while not printer_ok:
+-        printer_ok = kiosk_report.init_printer(conn = conn, config = config, queue_to_gui = queue_to_gui)
+-        time.sleep(3)
+-
+-    # Check Connection to Cache host
+-        time.sleep(1)
+-    s ='\n'.join(('Service thread started',
+-                'IP: {}'.format(kiosk_utils.host_info()[0]),
+-                'Host: {}'.format(kiosk_utils.host_info()[1]),
+-                'Watchdog: {}'.format(config['watchdog_device'])
+-                ))
+-    kiosk_utils.send_ticket(ticket_value=s,
+-                            ticket_type=kiosk_utils.TicketPurpose.SYS,
+-                            ticket_animate_cycles = 3,
+-                            queue_tx=queue_to_gui)
+-    cnt = 0
+-    with open("/sys/class/net/eth0/speed", "r") as f:
+-        eth_speed = int(f.read().strip())
+-    while not kiosk_utils.host_connection_ok(config['url_test']):
+-        cnt += 1
+-        kiosk_utils.send_ticket(ticket_value='Connection to\n{}\nfailed, eth spd: {}\nRetrying ({})...'
+-                                .format(config['url_test'].split('/')[2], eth_speed, cnt),
+-                                ticket_type=kiosk_utils.TicketPurpose.NET,
+-                                ticket_animate_cycles=1,
+-                                queue_tx=queue_to_gui)
+-        time.sleep(1)
+-
+-    kiosk_utils.send_ticket(ticket_value='Host connection OK\n{} eth spd: {}'.format(config['url_test'].split('/')[2][:18], eth_speed),
+-                            ticket_type=kiosk_utils.TicketPurpose.NET,
+-                            ticket_animate_cycles = 1,
+-                            queue_tx=queue_to_gui)    # Initialize the barcode reader
+-    bc_reader  = BarcodeReader(port=config['bc_reader_port'],
+-                            baudrate=config['bc_reader_boudrate'],
+-                            bounce=config['bc_reader_bounce'],
+-                            callback=bc_callback,
+-                            timeout=config['bc_timeout'],
+-                            config = config,
+-                            queueTX=queue_to_gui)
+-    bc_reader.start()
+-    cnt = 0
+-    while not bc_reader.running:
+-        cnt += 1
+-        kiosk_utils.send_ticket(ticket_value='Err starting BC reader:\n{}\nRetrying ({})...'.format(bc_reader.status, cnt),
+-                                ticket_type=kiosk_utils.TicketPurpose.BCR,
+-                                ticket_animate_cycles = 3,
+-                                queue_tx=queue_to_gui)
+-        bc_reader.start()
+-        time.sleep(5)
+-
+-    kiosk_utils.send_ticket(ticket_value='Barcode reader OK\n{}'.format(bc_reader.status),
+-                        ticket_type=kiosk_utils.TicketPurpose.BCR,
+-                        ticket_animate_cycles = 1,
+-                        queue_tx=queue_to_gui)
+-
+-    
+-
+-
+-    #END of the startup sequence
+-    #Clear popup screen
+-    kiosk_utils.send_ticket(ticket_type=kiosk_utils.TicketPurpose.EOT,
+-                            queue_tx=queue_to_gui)
+-    queue_from_gui.queue.clear()  # Clear the queue to avoid processing old messages
+-    # Start the main loop to listen for barcode reads
+-    while not th_ev.is_set():
+-        #print('^', end='', flush=True)  # Print a dot to indicate the listener is running
+-            
+-        if time.time() > last_msg_time + config['screen_brightness_to_min'] * 60 \
+-            and not kiosk_utils.is_working_time(start=config['working_hours'][0],
+-                                            end=config['working_hours'][1],
+-                                            workdays=config['working_days']):
+-            kiosk_utils.set_brightness(config['screen_brightness_inactive'])
+-            logging.debug("Screen brightness set to inactive level {}".format(config['screen_brightness_inactive']))
+-            last_msg_time = time.time()
+-
+-        if not queue_from_gui.empty():
+-            msg = queue_from_gui.get_nowait()
+-            proc_queue(msg, config=config)
+-            kiosk_utils.send_ticket(ticket_type=kiosk_utils.TicketPurpose.BCR,
+-                    ticket_animate_cycles = 1,
+-                    queue_tx=queue_to_gui)
+-            
+-            lang = msg 
+-        bc_reader.next()
+-        th_ev.wait(polling_int)  # Wait for the specified interval
+-
+-def bc_callback(*args) -> bool:
+-    """
+-    Callback function to handle the barcode read event.
+-    time.sleep used to ~ sync screen & audio with printer as there is no real-time feedback from printer.
+-    
+-    """
+-    global lang, conn
+-    barcode = args[0]
+-    config = args[1]
+-    queue_to_gui = args[2]
+-    reg_ex = config['bc_regex']
+-    logging.debug(f"Received barcode: {barcode}, lang: {lang[1]}")
+-    # Remove leading bc prefix if necessary
+-    if not barcode[0].isnumeric():
+-        barcode=barcode[1:]
+-    if re.match(reg_ex, barcode):
+-        barcode = barcode.replace('#','%23')
+-        kiosk_utils.speak_status(os.path.join(config['assets_loader'], 'attn.wav'), background=True)
+-        report_url = config['url'].format(config['host'],barcode,lang[1])
+-        r = kiosk_report.get_report_from_host(report_url, timeout = config['httpreq_timeout'])
+-        kiosk_utils.send_ticket(ticket_value = '<{}>'.format(r[0]),
+-                ticket_type=kiosk_utils.TicketPurpose.AOK,
+-                ticket_animate_cycles = 1,
+-                queue_tx=queue_to_gui)
+-        time.sleep(1)
+-        if r[0] == 200:
+-            report_pages = kiosk_utils.get_numpages_from_pdf(r[1])
+-            kiosk_utils.speak_status(os.path.join(config['assets_loader'], 'start_print{}.wav'.format(lang[1])), background=False)
+-
+-            if report_pages<11:
+-                kiosk_utils.speak_status(os.path.join(config['assets_loader'],
+-                                                      'NumPages_{}_{}.wav'.format(report_pages, lang[1])), background=False)
+-            else:
+-                kiosk_utils.speak_status(os.path.join(config['assets_loader'],
+-                                        'NumPages_10more_{}.wav'.format(lang[1])), background=False)
+-            
+-            kiosk_utils.send_ticket(ticket_type=kiosk_utils.TicketPurpose.PRN,
+-                ticket_animate_cycles = 2,
+-                ticket_value='{}:\n{}'.format(config['report_num_pages'][lang[0]], report_pages),
+-                queue_tx=queue_to_gui)
+-            
+-            time.sleep(config['report_delay'])
+-
+-            if kiosk_report.print_report(conn=conn, tmp_file=r[1]) is not None:
+-                kiosk_utils.send_ticket(ticket_type=kiosk_utils.TicketPurpose.AOK,
+-                    ticket_animate_cycles = 1,
+-                    queue_tx=queue_to_gui)
+-                kiosk_utils.speak_status(os.path.join(config['assets_loader'], 'end_print{}.wav'.format(lang[1])), background=False)
+-                return()
+-
+-        if r[0] == 409:
+-            kiosk_utils.send_ticket(ticket_value = 
+-                        config['report_not_ready_msg'][lang[0]].replace('\\', '\n'),
+-                        ticket_type=kiosk_utils.TicketPurpose.ERR,
+-                        ticket_animate_cycles = 2,
+-                        queue_tx=queue_to_gui)
+-            kiosk_utils.speak_status(os.path.join(config['assets_loader'], 'not_ready{}.wav'.format(lang[1])), background=False)
+-            return()
+-
+-        kiosk_utils.send_ticket(ticket_type=kiosk_utils.TicketPurpose.ERR,
+-                                    ticket_animate_cycles = 2,
+-                                    queue_tx=queue_to_gui)
+-        kiosk_utils.speak_status(os.path.join(config['assets_loader'], 'error-attn.wav'), background=False)
+-        return()
+-
+-    kiosk_utils.speak_status(os.path.join(config['assets_loader'], 'barcode_invalid{}.wav'.format(lang[1])), background=True)
+-    kiosk_utils.send_ticket(ticket_type=kiosk_utils.TicketPurpose.ERR,
+-                            ticket_animate_cycles = 2,
+-                            queue_tx=queue_to_gui)
+-    
+-def main():
+-    global config
+-    logging.basicConfig(format="%(levelname)s:%(asctime)s - %(message)s", level=logging.DEBUG)
++    reader = None
++
++    def notify(message=None, purpose=kiosk_utils.TicketPurpose.SYS, cycles=1):
++        kiosk_utils.send_ticket(ticket_value=message, ticket_type=purpose,
++                                ticket_animate_cycles=cycles, queue_tx=queue_to_gui)
++
++    try:
++        if th_ev.wait(1):
++            return
++        lang = (config['default_language_index'], config['languages'][config['default_language_index']])
++        last_msg_time = time.monotonic()
++        drain_queue(queue_from_gui)
++        conn = None
++        while not th_ev.is_set():
++            conn = kiosk_report.connect_to_cups()
++            if conn is not None:
++                break
++            notify('Error connecting to CUPS', kiosk_utils.TicketPurpose.ERR)
++            if th_ev.wait(5):
++                return
++        if th_ev.is_set():
++            return
++
++        reset_buttons = config['button_printer_reset']
++        if reset_buttons:
++            names = ', '.join(config['languages'][i] for i in reset_buttons)
++            kiosk_utils.speak_status(os.path.join(config['assets_loader'], 'attn.wav'))
++            notify(f'<{names}> to reset printers', kiosk_utils.TicketPurpose.PRN)
++            if th_ev.wait(5):
++                return
++            try:
++                msg = queue_from_gui.get_nowait()
++            except Empty:
++                msg = None
++            if msg is not None and msg[0] in reset_buttons:
++                kiosk_report.delete_printers(conn=conn)
++                notify('Resetting printers on CUPS', kiosk_utils.TicketPurpose.PRN)
++
++        while not th_ev.is_set():
++            if kiosk_report.init_printer(conn=conn, config=config, queue_to_gui=queue_to_gui):
++                break
++            if th_ev.wait(3):
++                return
++        if th_ev.is_set():
++            return
++
++        host = kiosk_utils.host_info() or ['unknown', 'unknown']
++        notify(f'Service thread started\nIP: {host[0]}\nHost: {host[1]}\nWatchdog: {config["watchdog_device"]}', cycles=3)
++        count = 0
++        server = urlsplit(config['url_test']).netloc
++        while not th_ev.is_set() and not kiosk_utils.host_connection_ok(config['url_test']):
++            count += 1
++            notify(f'Connection to\n{server}\nfailed, eth spd: {ethernet_speed()}\nRetrying ({count})...',
++                   kiosk_utils.TicketPurpose.NET)
++            if th_ev.wait(1):
++                return
++        if th_ev.is_set():
++            return
++        notify(f'Host connection OK\n{server[:18]} eth spd: {ethernet_speed()}', kiosk_utils.TicketPurpose.NET)
++
++        reader = BarcodeReader(port=config['bc_reader_port'], baudrate=config['bc_reader_boudrate'],
++                               bounce=config['bc_reader_bounce'], callback=bc_callback,
++                               timeout=config['bc_timeout'], config=config, queueTX=queue_to_gui)
++        reader.start()
++        if reader.running:
++            notify(f'Barcode reader OK\n{reader.port}', kiosk_utils.TicketPurpose.BCR)
++        drain_queue(queue_from_gui)
++        notify(purpose=kiosk_utils.TicketPurpose.EOT, cycles=0)
++        while not th_ev.is_set():
++            if not reader.running:
++                notify(f'Barcode reader unavailable:\n{reader.port}\nRetrying...', kiosk_utils.TicketPurpose.BCR)
++                reader.start()
++                if not reader.running:
++                    if th_ev.wait(5):
++                        return
++                    continue
++                notify(f'Barcode reader OK\n{reader.port}', kiosk_utils.TicketPurpose.BCR)
++
++            try:
++                msg = queue_from_gui.get_nowait()
++            except Empty:
++                msg = None
++            if msg is not None:
++                proc_queue(msg, config)
++                lang = msg
++                last_msg_time = time.monotonic()
++                notify(purpose=kiosk_utils.TicketPurpose.BCR)
++            if (time.monotonic() > last_msg_time + config['screen_brightness_to_min'] * 60
++                    and not kiosk_utils.is_working_time(start=config['working_hours'][0],
++                                                       end=config['working_hours'][1], workdays=config['working_days'])):
++                kiosk_utils.set_brightness(config['screen_brightness_inactive'], config['screen_brightness_path'])
++                last_msg_time = time.monotonic()
++            reader.next()
++            th_ev.wait(polling_int)
++    except Exception:
++        logging.exception('Kiosk service thread stopped unexpectedly')
++        notify('Service stopped\nRestart required', kiosk_utils.TicketPurpose.ERR, cycles=3)
++    finally:
++        if reader is not None:
++            reader.stop()
++
++
++def bc_callback(barcode, config, queue_to_gui):
++    """Validate the complete barcode, download the PDF and submit it to CUPS."""
++    selected = lang or (config['default_language_index'], config['languages'][config['default_language_index']])
++    language_index, language = selected
++
++    def sound(filename, background=False):
++        kiosk_utils.speak_status(os.path.join(config['assets_loader'], filename), background=background)
++
++    def notify(message=None, purpose=kiosk_utils.TicketPurpose.ERR, cycles=2):
++        kiosk_utils.send_ticket(ticket_value=message, ticket_type=purpose,
++                                ticket_animate_cycles=cycles, queue_tx=queue_to_gui)
++
++    if barcode and not barcode[0].isnumeric():
++        barcode = barcode[1:]
++    if not barcode or re.fullmatch(config['bc_regex'], barcode) is None:
++        sound(f'barcode_invalid{language}.wav', background=True)
++        notify()
++        return False
++
++    path = None
++    try:
++        sound('attn.wav', background=True)
++        url = config['url'].format(config['host'], quote(barcode, safe=''), quote(language, safe=''))
++        status, path = kiosk_report.get_report_from_host(url, timeout=config['httpreq_timeout'])
++        if status == 409:
++            notify(config['report_not_ready_msg'][language_index].replace('\\', '\n'))
++            sound(f'not_ready{language}.wav')
++            return False
++        if status != 200 or path is None:
++            notify('Report download failed')
++            sound('error-attn.wav')
++            return False
++        pages = kiosk_utils.get_numpages_from_pdf(path)
++        sound(f'start_print{language}.wav')
++        sound(f'NumPages_{pages}_{language}.wav' if pages < 11 else f'NumPages_10more_{language}.wav')
++        notify(f'{config["report_num_pages"][language_index]}:\n{pages}', kiosk_utils.TicketPurpose.PRN)
++        time.sleep(config['report_delay'])
++        job_id = kiosk_report.print_report(conn=conn, tmp_file=path)
++        if job_id is None:
++            notify('Print submission failed')
++            sound('error-attn.wav')
++            return False
++        notify(purpose=kiosk_utils.TicketPurpose.AOK, cycles=1)
++        sound(f'end_print{language}.wav')
++        return True
++    except (OSError, ValueError, subprocess.SubprocessError) as exc:
++        logging.error('Report processing failed (%s)', type(exc).__name__)
++        notify('Report processing failed')
++        sound('error-attn.wav')
++        return False
++    finally:
++        if path is not None:
++            try:
++                os.unlink(path)
++            except FileNotFoundError:
++                pass
++            except OSError:
++                logging.warning('Cannot remove temporary report')
+--- before/kiosk_utils.py
++++ after/kiosk_utils.py
+@@ -2,15 +2,15 @@
+ ''' A module for utility classes and functions. '''
+ 
+ import os
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from enum import Enum, auto
+ from queue import Queue
+ import subprocess
++import threading
+ import logging
+ import requests
+ import kiosk_config
+ from pathlib import Path
+-from time import sleep
+ queue_to_gui = Queue()
+ config = dict()
+ 
+@@ -28,14 +28,14 @@
+ 
+ class Ticket(object):
+     """Class to represent a ticket with a type and value."""
+-    def __init__(self, ticket_type = TicketPurpose, ticket_value:str= None, ticket_display_time:int = 0, ticket_animate_cycles:int = 0):
++    def __init__(self, ticket_type = TicketPurpose.SYS, ticket_value:str= None, ticket_display_time:int = 0, ticket_animate_cycles:int = 0):
+         self.ticket_type:TicketPurpose = ticket_type
+         self.ticket_value:str = ticket_value
+         self.ticket_display_time:int = ticket_display_time
+         self.ticket_animate_cycles:int = ticket_animate_cycles
+ 
+ def send_ticket(ticket_value:str = None, 
+-                ticket_type:Ticket=TicketPurpose.SYS, 
++                ticket_type:TicketPurpose=TicketPurpose.SYS, 
+                 ticket_display_time:int = 0,
+                 ticket_animate_cycles:int = 0,
+                 queue_tx:Queue = None):
+@@ -51,6 +51,8 @@
+                     ticket_display_time=ticket_display_time,
+                     ticket_animate_cycles=ticket_animate_cycles)
+     
++    if queue_tx is None:
++        queue_tx = queue_to_gui
+     queue_tx.put(ticket)
+     logging.info(f"Ticket sent: <{ticket.ticket_value}> of type <{ticket.ticket_type}>")
+ 
+@@ -62,38 +64,48 @@
+     try:
+         return([subprocess.check_output(['hostname', '-I']).decode('utf-8').strip(),
+                 subprocess.check_output(['hostname', '-f']).decode('utf-8').strip()]) 
+-    except:
++    except (OSError, subprocess.SubprocessError):
+         return(None)
+     
+ def get_numpages_from_pdf(f:str) -> int:
+     result = subprocess.run(
+-    ['bash', '-c', 'pdfinfo {} | grep "Pages:"'.format(f)],
+-    capture_output=True, text=True
++    ['pdfinfo', str(f)],
++    capture_output=True, text=True, check=True, timeout=15
+     )
+     # Store the result in a variable
+-    pages_info = result.stdout.strip()
+-    return(int(pages_info[6:].strip()))
++    for line in result.stdout.splitlines():
++        if line.startswith('Pages:'):
++            pages = int(line.split(':', 1)[1].strip())
++            if pages > 0:
++                return pages
++    raise ValueError('PDF contains no readable pages')
+     
+ def speak_status(f, background = True)-> None:
+     '''
+     Speak status messages
+     '''
+-    if background:
+-        try:
+-            os.popen('aplay -q {} 2>&1'.format(f))
+-        except Exception:
+-            logging.error(f"Error playing sound: {f}, {e}")
++    try:
++        args = ['aplay', '-q', str(f)]
++        if background:
++            process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++            threading.Thread(target=process.wait, daemon=True).start()
++        else:
++            subprocess.run(args, check=True, timeout=60, stdout=subprocess.DEVNULL,
++                           stderr=subprocess.DEVNULL)
++    except (OSError, subprocess.SubprocessError) as exc:
++        logging.warning('Error playing sound %s: %s', f, exc)
++
++def set_brightness(level: int, path:str = "/sys/class/backlight") -> bool:
++    backlight_base = Path(path)
++    if backlight_base.name == 'brightness':
++        devices = [backlight_base.parent]
++    elif (backlight_base / 'brightness').exists():
++        devices = [backlight_base]
+     else:
+-        try:
+-            os.system('aplay -q {} 2>&1'.format(f))
+-        except Exception as e:
+-            logging.error(f"Error playing sound: {f}, {e}")
+-
+-def set_brightness(level: int, path:str = "/sys/class/backlight") -> None:
+-    backlight_base = Path(path)
+-    devices = list(backlight_base.glob("*"))
++        devices = list(backlight_base.glob("*"))
+     if not devices:
+-        raise RuntimeError(f"No backlight device found on {backlight_base}")
++        logging.warning('No backlight device found on %s', backlight_base)
++        return False
+ 
+     errors = []
+     successes = 0
+@@ -112,52 +124,60 @@
+ 
+     if successes == 0:
+         logging.error("Failed to set brightness on all devices: %s", errors)
+-        raise RuntimeError(f"Failed to set brightness on all devices: {errors}")
++        return False
+ 
+     if errors:
+         logging.debug("Some backlight devices failed, but brightness was set: %s", errors)
+-
+-def set_screen_dpms(timeout_seconds: int) -> None:
++    return True
++
++def set_screen_dpms(timeout_seconds: int) -> bool:
+     """
+     Set X11 screen blanking timeout.
+ 
+     timeout_seconds=0 disables the screen saver.
+     """
+     env = os.environ.copy()
+-    env["DISPLAY"] = ":0"
+-    if timeout_seconds <= 0:
+-        subprocess.run(
+-            ["xset", "-dpms"],
+-            env=env,
+-            check=True
+-        )
+-    else:
+-        subprocess.run(
+-            ["xset", "dpms", "{} {} {}".format(timeout_seconds, timeout_seconds, timeout_seconds)],
+-            env=env,
+-            check=True
+-        )
++    env.setdefault('DISPLAY', ':0')
++    commands = [['xset', '-dpms']] if timeout_seconds <= 0 else [
++        ['xset', '+dpms'],
++        ['xset', 'dpms', *([str(timeout_seconds)] * 3)],
++    ]
++    try:
++        for args in commands:
++            subprocess.run(args, env=env, check=True, timeout=5, capture_output=True)
++    except (OSError, subprocess.SubprocessError) as exc:
++        logging.warning('Cannot configure display power saving: %s', exc)
++        return False
++    return True
+         
+-def host_connection_ok(url) -> None:
++def host_connection_ok(url) -> bool:
+     '''
+     Test connection to host
+     '''
+     try:
+         #requests.head(url,timeout=10)
+-        r = requests.get(url, timeout=10)
+-        return(r.text.strip() == 'OK')
+-    except requests.ConnectionError:
++        with requests.get(url, timeout=10) as response:
++            return response.status_code == 200 and response.text.strip() == 'OK'
++    except requests.RequestException:
+         return(False)
+     
+ def is_working_time(now:str = None, start:str='7:30', end:str='19:00', workdays:tuple=(0, 1, 2, 3, 4)):
+-    now = datetime.now() if now is None else datetime.strptime(now, "%H:%M").time()
++    if now is None:
++        now = datetime.now()
++    elif isinstance(now, str):
++        now = datetime.combine(datetime.now().date(), datetime.strptime(now, '%H:%M').time())
+     # Convert strings to time objects
+     start_time = datetime.strptime(start, "%H:%M").time()
+     end_time = datetime.strptime(end, "%H:%M").time()    
+-    return (now.weekday() in workdays) and (start_time <= now.time() <= end_time)
++    if start_time <= end_time:
++        return now.weekday() in workdays and start_time <= now.time() <= end_time
++    # The early-morning portion of an overnight shift belongs to the previous day.
++    return ((now.weekday() in workdays and now.time() >= start_time) or
++            ((now - timedelta(days=1)).weekday() in workdays and now.time() <= end_time))
+ 
+ class WatchDog(object):
+     def __init__(self, wd_device:str = '/dev/watchdog'):
++        self._wd = None
+         try:
+             self._wd = open(wd_device, "w")
+         except Exception as e:
+@@ -165,6 +185,8 @@
+             return(None)
+         
+     def pat(self):
++        if self._wd is None:
++            return False
+         try:
+             print('1',file = self._wd, flush = True)
+             # print('.', end='', flush=True) 
+@@ -173,13 +195,17 @@
+             return(False)
+ 
+     def stop(self):
++        if self._wd is None:
++            return False
+         try:
+             print('V',file = self._wd, flush = True)
++            self._wd.close()
++            self._wd = None
+             return(True)
+         except:
+             return(False)
+ def main():
+-    config = kiosk_config.read_config(os.path.join(os.getcwd(),'kiosk.ini'))
++    config = kiosk_config.read_config(str(Path(__file__).with_name('kiosk.ini')))
+     print(config)
+     print(is_working_time(start=config['working_hours'][0], end=config['working_hours'][1], workdays=tuple(config['working_days'])))
+     set_screen_dpms(0)
+--- before/make_logdirs.sh
++++ after/make_logdirs.sh
+@@ -11,11 +11,6 @@
+     fi
+ 
+     TARGET_PATH="$1"
+-
+-    if [[ "$TARGET_PATH" =~ [[:space:]] ]]; then
+-        printf "Error: File path contains whitespace, which is not allowed: %s\n" "$TARGET_PATH" >&2
+-        return 1
+-    fi
+ 
+     if [[ "$TARGET_PATH" != /* ]]; then
+         printf "Error: Path must be absolute: %s\n" "$TARGET_PATH" >&2
+@@ -32,13 +27,17 @@
+ }
+ 
+ create_directory_and_file() {
+-    if ! mkdir -p "$TARGET_DIR"; then
++    if ! mkdir -p -- "$TARGET_DIR"; then
+         printf "Error: Failed to create directory: %s\n" "$TARGET_DIR" >&2
+         return 1
+     fi
+ 
++    if [[ -e "$TARGET_PATH" && ! -f "$TARGET_PATH" ]]; then
++        printf "Error: Not a regular file: %s\n" "$TARGET_PATH" >&2
++        return 1
++    fi
+     if [[ ! -f "$TARGET_PATH" ]]; then
+-        if ! touch "$TARGET_PATH"; then
++        if ! touch -- "$TARGET_PATH"; then
+             printf "Error: Failed to create file: %s\n" "$TARGET_PATH" >&2
+             return 1
+         fi
+--- before/preppi.sh
++++ after/preppi.sh
+@@ -1,90 +1,62 @@
+ #!/bin/bash
+-
+-USER="pi"
+-GROUP="kiosk"
+-WORK_DIR="/opt/kiosk/"
+-USER_DIR="/home/pi/"
+-# Disable bluetooth & WiFi
+-
+-# Ensure the script is run as root
++# Prepare this kiosk from any working directory. Run explicitly as root.
++set -euo pipefail
++KIOSK_USER="pi"
++KIOSK_GROUP="kiosk"
++WORK_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
++USER_DIR=$(getent passwd "$KIOSK_USER" | cut -d: -f6)
+ if [[ $EUID -ne 0 ]]; then
+-    echo "Please run this script as root (e.g. sudo $0)"
++    echo "Please run this script as root (e.g. sudo $0)" >&2
+     exit 1
+ fi
++[[ -n "$USER_DIR" ]] || { echo "Kiosk user does not exist" >&2; exit 1; }
++getent group "$KIOSK_GROUP" >/dev/null || groupadd --system "$KIOSK_GROUP"
++getent group watchdog >/dev/null || groupadd --system watchdog
++# Some Pi images do not ship both Bluetooth services.
++for unit in bluetooth.service hciuart.service; do
++    if systemctl cat "$unit" >/dev/null 2>&1; then
++        systemctl disable "$unit"
++    fi
++done
+ 
+-systemctl disable bluetooth.service
+-systemctl disable hciuart.service
+-
+-#Install minimal X server and dependencies
+-apt-get install python3-tk xserver-xorg xinit openbox -y
+-apt-get install xserver-xorg-legacy -y
+-apt-get install xterm -y
+-apt-get install x11-xserver-utils -y
+-apt-get install xinput -y
+-apt-get install fonts-dejavu fonts-liberation fonts-freefont-ttf fonts-noto-core-y
+-printf "Changing Xwrapper.config\n"
+-#sed -i 's/^allowed_users=console$/allowed_users=anybody\nneeds_root_rights=yes/' /etc/X11/Xwrapper.config
+-tee /etc/X11/Xwrapper.config >/dev/null <<'EOF'
++apt-get install -y python3-tk python3-pil.imagetk python3-pip python3-venv \
++    xserver-xorg xserver-xorg-legacy xinit openbox xterm x11-xserver-utils xinput \
++    fonts-dejavu fonts-liberation fonts-freefont-ttf fonts-noto-core \
++    gcc python3-dev libcups2-dev cups cups-bsd cups-browsed poppler-utils alsa-utils ethtool
++# Configure noninteractive X startup after installing Xorg legacy.
++cat > /etc/X11/Xwrapper.config <<'EOF'
+ allowed_users=anybody
+ needs_root_rights=yes
+ EOF
++usermod -aG "$KIOSK_GROUP",lpadmin,lp,dialout,audio,video,watchdog "$KIOSK_USER"
++"$WORK_DIR/change_cups-browsed.sh"
++systemctl restart cups.service cups-browsed.service
++"$WORK_DIR/touchpad_rules.sh"
++"$WORK_DIR/update_config_txt.sh" /boot/firmware/config.txt
++"$WORK_DIR/update_cmdline.sh"
++printf 'KERNEL=="watchdog", MODE="0660", OWNER="%s", GROUP="watchdog"\n' "$KIOSK_USER" \
++    > /etc/udev/rules.d/60-watchdog.rules
++udevadm control --reload-rules
+ 
+-dpkg-reconfigure xserver-xorg-legacy
+-printf "Changing Xwrapper.config... done\n"
+-
+-#Install tkinter & stuff
+-apt-get install python3-tk -y
+-apt-get install python3-pil.imagetk -y
+-printf "Installing tkinter & dependencies... done\n"
+-
+-apt-get install python3-pip -y
+-sed -i '/^\[global\]$/a break-system-packages = true' /etc/pip.conf
+-printf "Installing pip & configuring... done\n"
+-
+-apt-get install gcc python3-dev libcups2-dev cups cups-bsd -y
+-sleep 1
+-cupsctl --remote-admin --remote-any
+-usermod -aG lpadmin $USER
+-usermod -aG lp $USER
+-#Disable CUPS-browsed
+-./change_cups-browsed.sh
+-sleep 1
+-service cups restart
+-printf "Installing & configuring CUPS... done\n"
+-
+-#Rotate WaveShare display, set touchscreen rotation
+-./touchpad_rules.sh
+-printf "Setting touchpad... done\n"
+-./update_config_txt.sh "/boot/firmware/config.txt"
+-printf "Updating config.txt... done\n"
+-./update_cmdline.sh
+-printf "Updating cmdline.sh... done\n"
+-
+-#Set up watchdog
+-addgroup watchdog
+-usermod -aG watchdog "${USER}"
+-printf 'KERNEL=="watchdog", MODE="0660", OWNER="pi", GROUP="watchdog"\n' > /etc/udev/rules.d/60-watchdog.rules
+-#Chown pi:kiosk /dev/watchdog
+-printf "Configuring watchdog... done\n"
+-
+-#Install Python dependencies in virtual environment
+-apt-get install python3-venv -y
+-python3 -m venv --system-site-packages "${WORK_DIR}.venv"
+-source .venv/bin/activate
+-pip3 install customtkinter
+-pip3 install pillow
+-pip3 install pyserial
+-pip3 --no-input install pycups
+-
+-#Setting timezone & logs"
++python3 -m venv --system-site-packages "$WORK_DIR/.venv"
++"$WORK_DIR/.venv/bin/python" -m pip --no-input install -r "$WORK_DIR/requirements.txt"
+ timedatectl set-timezone Europe/Riga
+-printf "Setting logfiles\n"
+-touch "${WORK_DIR}kiosk.log" 
+-./make_logdirs.sh "/var/log/kiosk/kiosk.log"
+-ln -s "${WORK_DIR}kiosk.log" "${USER_DIR}kiosk.log"
+-ln "${WORK_DIR}firstboot.service" "/etc/systemd/system/firstboot.service"
+-ln "${WORK_DIR}kiosk.service" "/etc/systemd/system/kiosk.service"
+-ln "${WORK_DIR}wait-for-ethernet.service" "/etc/systemd/system/wait-for-ethernet.service"
+-nmcli connection modify "Wired connection 1" ipv4.method auto
+-systemctl enable firstboot.service
+-systemctl enable wait-for-ethernet.service
++"$WORK_DIR/make_logdirs.sh" "$WORK_DIR/kiosk.log"
++"$WORK_DIR/make_logdirs.sh" /var/log/kiosk/kiosk.log
++chown "$KIOSK_USER:$KIOSK_GROUP" "$WORK_DIR/kiosk.log" /var/log/kiosk/kiosk.log
++ln -sfn -- "$WORK_DIR/kiosk.log" "$USER_DIR/kiosk.log"
++for unit in firstboot.service kiosk.service wait-for-ethernet.service; do
++    # Copy through a temporary file to avoid preexisting hard-link surprises.
++    unit_temp=$(mktemp "/etc/systemd/system/.${unit}.XXXXXX")
++    install -m 644 "$WORK_DIR/$unit" "$unit_temp"
++    mv -f -- "$unit_temp" "/etc/systemd/system/$unit"
++done
++install -m 644 "$WORK_DIR/kiosk-clear-print-jobs.service" /etc/systemd/system/kiosk-clear-print-jobs.service
++for unit in cups.service cups.socket cups.path; do
++    install -d -m 755 "/etc/systemd/system/${unit}.d"
++    install -m 644 "$WORK_DIR/systemd/${unit}.d/kiosk-clear-print-jobs.conf" \
++        "/etc/systemd/system/${unit}.d/kiosk-clear-print-jobs.conf"
++done
++systemctl daemon-reload
++systemctl enable firstboot.service wait-for-ethernet.service
++printf '%s\n' 'Preparation complete. First-boot configuration will run on the next boot.'
+--- /dev/null
++++ after/requirements.txt
+@@ -0,0 +1,5 @@
++customtkinter>=5.2,<7
++Pillow>=9.1
++pyserial>=3.5,<4
++pycups>=2.0,<3
++requests>=2.28,<3
+--- before/st.sh
++++ after/st.sh
+@@ -1,7 +1,5 @@
+ #!/bin/sh
+-sleep 1
+-export XAUTHORITY=/home/pi/.Xauthority
+-printf "Launching xinit"
+-/usr/bin/xinit /opt/kiosk/start_kiosk.sh
+-printf "END Launching xinit"
+-
++set -eu
++export XAUTHORITY="${XAUTHORITY:-/home/pi/.Xauthority}"
++printf '%s\n' "Launching xinit"
++exec /usr/bin/xinit /opt/kiosk/start_kiosk.sh -- :0 -nolisten tcp
+--- before/start_kiosk.sh
++++ after/start_kiosk.sh
+@@ -1,11 +1,11 @@
+ #!/bin/sh
+-sleep 1
+-export DISPLAY=:0
+-export XAUTHORITY=/home/pi/.Xauthority
+-xset s off
+-xset s noblank
+-xset -dpms
+-xrandr --output DSI-1 --rotate right
+-sleep 1
+-exec /opt/kiosk/.venv/bin/python /opt/kiosk/kiosk_main.py
+-
++set -eu
++SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
++export DISPLAY="${DISPLAY:-:0}"
++export XAUTHORITY="${XAUTHORITY:-/home/pi/.Xauthority}"
++# Display extensions depend on the installed X server and connected panel.
++xset s off || true
++xset s noblank || true
++xset -dpms || true
++xrandr --output DSI-1 --rotate right || true
++exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/kiosk_main.py" "$@"
+--- before/start_tk.sh
++++ after/start_tk.sh
+@@ -1,6 +1,5 @@
+ #!/bin/sh
+-xrandr --output DSI-1 --rotate right
+-sleep 1
+-DISPLAY=:0 xset -dpms
+-exec python3 /opt/kiosk/test.py
+-#exec  xterm
++set -eu
++SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
++# Reuse the maintained launcher; the former test.py target does not exist.
++exec "$SCRIPT_DIR/start_kiosk.sh" "$@"
+--- /dev/null
++++ after/systemd/cups.path.d/kiosk-clear-print-jobs.conf
+@@ -0,0 +1,3 @@
++[Unit]
++Requires=kiosk-clear-print-jobs.service
++After=kiosk-clear-print-jobs.service
+--- /dev/null
++++ after/systemd/cups.service.d/kiosk-clear-print-jobs.conf
+@@ -0,0 +1,3 @@
++[Unit]
++Requires=kiosk-clear-print-jobs.service
++After=kiosk-clear-print-jobs.service
+--- /dev/null
++++ after/systemd/cups.socket.d/kiosk-clear-print-jobs.conf
+@@ -0,0 +1,3 @@
++[Unit]
++Requires=kiosk-clear-print-jobs.service
++After=kiosk-clear-print-jobs.service
+--- /dev/null
++++ after/tests/gui_smoke.py
+@@ -0,0 +1,77 @@
++"""Optional real-widget smoke check: DISPLAY=:99 .venv/bin/python tests/gui_smoke.py.
++
++Run against a virtual X server. Hardware actions are mocked and no worker starts.
++"""
++from pathlib import Path
++from queue import Queue
++import sys
++import threading
++from unittest.mock import Mock, patch
++
++from PIL import Image
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++import kiosk_config
++import kiosk_main as gui
++from kiosk_utils import Ticket, TicketPurpose
++
++
++def main():
++    root = Path(__file__).resolve().parents[1]
++    config = kiosk_config.read_config(root / 'kiosk.ini')
++    config.update(button_debounce_time_ms=50, button_reset_to_default_time_ms=100000,
++                  animated_icon_delay=10, animated_icon_width=30, animated_icon_height=30)
++    gui.config = config
++    gui.img_cache = {value: [Image.new('RGBA', (30, 30), 'white'), Image.new('RGBA', (30, 30), 'blue')]
++                     for key, value in config.items()
++                     if key.startswith('animated_icon_') and isinstance(value, str)}
++    queue, stop, errors = Queue(), threading.Event(), []
++    worker = Mock()
++    worker.is_alive.return_value = True
++    with patch('kiosk_utils.set_brightness'), patch('kiosk_utils.set_screen_dpms'):
++        app = gui.KioskApp(config=config, queue_to_gui=queue, slave_thread=worker, stop_event=stop)
++        app.report_callback_exception = lambda *exc: errors.append(exc)
++        app.update()
++        app._display_dpms = 15
++        app.frame.on_click((1, 'ENG'))
++        assert gui.queue_from_gui.get_nowait() == (1, 'ENG')
++        assert all(button.cget('state') == 'disabled' for button in app.frame.buttons)
++        app.after(80, app.quit)
++        app.mainloop()
++        assert all(button.cget('state') == 'normal' for button in app.frame.buttons)
++        queue.put(Ticket(TicketPurpose.BCR, 'Barcode', ticket_animate_cycles=1))
++        app.check_queue()
++        app.update()
++        first = app.popup_window.frame.icon
++        first.stop_animation()
++        queue.put(Ticket(TicketPurpose.BCR, 'Again', ticket_animate_cycles=2))
++        app.check_queue()
++        assert first is app.popup_window.frame.icon
++        assert first._is_animating
++        first.stop_animation()
++        queue.put(Ticket(TicketPurpose.ERR, 'Error', ticket_animate_cycles=1))
++        app.check_queue()
++        app.update()
++        assert first is not app.popup_window.frame.icon
++        app.popup_window.frame.icon.stop_animation()
++        queue.put(Ticket(TicketPurpose.EOT))
++        app.check_queue()
++        app.update()
++        # An explicit ticket duration holds the popup even if its animation ends.
++        queue.put(Ticket(TicketPurpose.AOK, 'Timed', ticket_display_time=1000, ticket_animate_cycles=1))
++        app.check_queue()
++        app.popup_window.frame.icon.stop_animation()
++        queue.put(Ticket(TicketPurpose.ERR, 'Next', ticket_animate_cycles=1))
++        app.check_queue()
++        assert queue.qsize() == 1
++        app.popup_window.minimum_display_until = 0
++        app.check_queue()
++        assert queue.empty()
++        app.quit_app()
++        assert stop.is_set()
++    assert not errors, errors
++    print('GUI smoke passed: startup, language selection, debounce, popup reuse, icon changes, ticket duration, shutdown')
++
++
++if __name__ == '__main__':
++    main()
+--- /dev/null
++++ after/tests/test_kiosk.py
+@@ -0,0 +1,486 @@
++"""Regression checks that never contact the host, print, reboot, or edit /boot."""
++from datetime import datetime
++import logging
++import os
++from pathlib import Path
++from queue import Queue
++import subprocess
++import sys
++import tempfile
++import threading
++import unittest
++from unittest.mock import Mock, patch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++import cups
++import requests
++import serial
++from PIL import Image
++import kiosk_animated_label as animation
++import kiosk_bcr
++import kiosk_boot_config as boot
++import kiosk_config
++import kiosk_main
++import kiosk_report as report
++import kiosk_service as service
++import kiosk_utils as utils
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def response(status=200, content_type='application/pdf', content=b'%PDF-test'):
++    result = Mock(status_code=status, headers={'Content-Type': content_type}, content=content)
++    result.__enter__ = Mock(return_value=result)
++    result.__exit__ = Mock(return_value=False)
++    return result
++
++
++class ConfigTests(unittest.TestCase):
++    def test_installed_configuration(self):
++        config = kiosk_config.read_config(ROOT / 'kiosk.ini')
++        self.assertIsNotNone(config)
++        self.assertEqual(config['assets_loader'], str(ROOT / 'assets'))
++        self.assertIn('button_reset_to_default_time_ms', config)
++        for key, value in config.items():
++            if key.startswith('animated_icon_') and isinstance(value, str):
++                self.assertTrue((Path(config['assets_loader']) / value).is_file())
++
++    def test_defaults_and_whitespace(self):
++        with tempfile.TemporaryDirectory() as folder:
++            path = Path(folder) / 'custom.ini'
++            path.write_text('[INTERFACE]\nlanguages = LAT, ENG, RUS\n')
++            config = kiosk_config.read_config(path)
++            self.assertEqual(config['languages'], ['LAT', 'ENG', 'RUS'])
++            self.assertEqual(config['working_hours'], ['7:30', '19:00'])
++            self.assertEqual(config['assets_loader'], str(Path(folder) / 'assets'))
++
++    def test_invalid_config_returns_none(self):
++        for content in ('[INTERFACE]\ndefault_language_index=9',
++                        '[INTERFACE]\nanimated_icon_delay=bad',
++                        '[BARCODE]\nbc_regex=[',
++                        '[REPORT]\nprinters=this is invalid',
++                        '[INTERFACE]\nworking_hours=7,19',
++                        '[REPORT]\nbutton_printer_reset=9'):
++            with self.subTest(content=content), tempfile.TemporaryDirectory() as folder:
++                path = Path(folder) / 'kiosk.ini'
++                path.write_text(content)
++                self.assertIsNone(kiosk_config.read_config(path))
++
++    def test_literal_percent_in_url(self):
++        with tempfile.TemporaryDirectory() as folder:
++            path = Path(folder) / 'config.ini'
++            path.write_text('[REPORT]\nurl=http://host/?HASH=%23{}\n')
++            self.assertEqual(kiosk_config.read_config(path)['url'], 'http://host/?HASH=%23{}')
++
++
++class UtilityTests(unittest.TestCase):
++    def test_failed_watchdog_is_inactive(self):
++        with patch('builtins.open', side_effect=OSError('missing watchdog')):
++            watchdog = utils.WatchDog('/dev/missing')
++        self.assertFalse(watchdog.pat())
++        self.assertFalse(watchdog.stop())
++
++    def test_watchdog_stops_and_closes(self):
++        with tempfile.TemporaryDirectory() as folder:
++            path = Path(folder) / 'watchdog'
++            watchdog = utils.WatchDog(path)
++            self.assertTrue(watchdog.pat())
++            self.assertTrue(watchdog.stop())
++            self.assertEqual(path.read_text(), '1\nV\n')
++            self.assertFalse(watchdog.pat())
++
++    def test_weekdays_and_overnight_shifts(self):
++        self.assertTrue(utils.is_working_time(datetime(2026, 10, 2, 10), '7:30', '19:00'))
++        self.assertFalse(utils.is_working_time(datetime(2026, 10, 3, 10), '7:30', '19:00'))
++        self.assertTrue(utils.is_working_time(datetime(2026, 10, 3, 1), '22:00', '06:00'))
++        self.assertFalse(utils.is_working_time(datetime(2026, 10, 4, 1), '22:00', '06:00'))
++        self.assertIsInstance(utils.is_working_time('10:00'), bool)
++
++    def test_safe_pdf_filename_and_page_count(self):
++        with tempfile.TemporaryDirectory() as folder:
++            path = Path(folder) / 'report; touch INJECTED.pdf'
++            with Image.new('RGB', (20, 20), 'white') as image:
++                image.save(path, 'PDF')
++            self.assertEqual(utils.get_numpages_from_pdf(path), 1)
++            self.assertFalse((Path(folder) / 'INJECTED.pdf').exists())
++
++    def test_brightness_base_device_and_file_paths(self):
++        with tempfile.TemporaryDirectory() as folder:
++            device = Path(folder) / 'panel'
++            device.mkdir()
++            (device / 'max_brightness').write_text('100')
++            (device / 'brightness').write_text('0')
++            for path in (folder, device, device / 'brightness'):
++                self.assertTrue(utils.set_brightness(255, path))
++                self.assertEqual((device / 'brightness').read_text(), '100')
++            self.assertTrue(utils.set_brightness(-1, device))
++            self.assertEqual((device / 'brightness').read_text(), '0')
++
++    def test_missing_backlight_is_nonfatal(self):
++        with tempfile.TemporaryDirectory() as folder:
++            self.assertFalse(utils.set_brightness(100, folder))
++
++    def test_dpms_arguments_and_failures(self):
++        with patch.object(utils.subprocess, 'run') as run:
++            self.assertTrue(utils.set_screen_dpms(15))
++            self.assertEqual(run.call_args.args[0], ['xset', 'dpms', '15', '15', '15'])
++            run.side_effect = FileNotFoundError()
++            self.assertFalse(utils.set_screen_dpms(15))
++
++    def test_host_timeout_and_status(self):
++        with patch.object(utils.requests, 'get', side_effect=requests.Timeout()):
++            self.assertFalse(utils.host_connection_ok('http://host'))
++        result = response(status=500)
++        result.text = 'OK'
++        with patch.object(utils.requests, 'get', return_value=result):
++            self.assertFalse(utils.host_connection_ok('http://host'))
++
++
++class ReportTests(unittest.TestCase):
++    def test_connection_runtime_error(self):
++        with patch.object(report.cups, 'Connection', side_effect=RuntimeError('offline')):
++            self.assertIsNone(report.connect_to_cups())
++
++    def test_download_timeout_has_consistent_result(self):
++        with patch.object(report.requests, 'get', side_effect=requests.ReadTimeout()):
++            self.assertEqual(report.get_report_from_host('http://host'), [None, None])
++
++    def test_pdf_content_type_parameters(self):
++        with patch.object(report.requests, 'get', return_value=response(content_type='application/pdf; charset=binary')):
++            status, path = report.get_report_from_host('http://host')
++        try:
++            self.assertEqual(status, 200)
++            self.assertEqual(Path(path).read_bytes(), b'%PDF-test')
++        finally:
++            os.unlink(path)
++
++    def test_non_pdf_and_unready_responses(self):
++        for status, mime in ((200, 'text/html'), (409, 'application/pdf'), (500, 'text/html')):
++            with patch.object(report.requests, 'get', return_value=response(status, mime)):
++                self.assertEqual(report.get_report_from_host('http://host'), [status, None])
++
++    def test_write_error_cleans_temporary_file(self):
++        with tempfile.TemporaryDirectory() as folder:
++            path = Path(folder) / 'report.pdf'
++            path.touch()
++            stream = Mock(name=str(path))
++            stream.name = str(path)
++            stream.__enter__ = Mock(return_value=stream)
++            stream.__exit__ = Mock(return_value=False)
++            stream.write.side_effect = OSError('disk full')
++            with patch.object(report.requests, 'get', return_value=response()), \
++                    patch.object(report.tempfile, 'NamedTemporaryFile', return_value=stream):
++                self.assertEqual(report.get_report_from_host('http://host'), [None, None])
++            self.assertFalse(path.exists())
++
++    def test_no_matching_printer_or_ppd(self):
++        conn = Mock()
++        available = {'usb://HP': {'device-make-and-model': 'HP LaserJet'}}
++        self.assertFalse(report.add_printer(conn, {'Canon': 'model'}, available)[0])
++        conn.getPPDs.return_value = {}
++        self.assertFalse(report.add_printer(conn, {'HP': 'model'}, available)[0])
++        conn.addPrinter.assert_not_called()
++
++    def test_printer_install_returns_true_and_keeps_other_queues(self):
++        conn = Mock()
++        conn.getDevices.return_value = {'usb://HP': {'device-make-and-model': 'HP LaserJet'}}
++        conn.getPrinters.return_value = {'other': {'device-uri': 'usb://Other'}}
++        conn.getDefault.return_value = 'other'
++        conn.getPPDs.return_value = {'hp.ppd': {}}
++        config = {'include_schemes': ['usb'], 'printers': {'HP': 'HP model'}}
++        self.assertTrue(report.init_printer(conn, config, Queue()))
++        conn.deletePrinter.assert_not_called()
++        conn.printTestPage.assert_not_called()
++        conn.setDefault.assert_called_once_with('HP_model')
++
++    def test_failed_install_returns_false(self):
++        conn = Mock()
++        conn.getDevices.return_value = {'usb://Other': {}}
++        conn.getPrinters.return_value = {}
++        conn.getDefault.return_value = None
++        self.assertFalse(report.init_printer(conn, {'include_schemes': ['usb'], 'printers': {'HP': 'model'}}, Queue()))
++
++    def test_printer_init_preserves_new_test_page_jobs(self):
++        conn = Mock()
++        conn.getDevices.return_value = {'usb://HP': {}}
++        conn.getPrinters.return_value = {'HP': {'device-uri': 'usb://HP'}}
++        conn.getDefault.return_value = 'HP'
++        self.assertTrue(report.init_printer(conn, {'include_schemes': ['usb'], 'printers': {}}, Queue()))
++        conn.cancelAllJobs.assert_not_called()
++
++    def test_print_uses_default_and_preserves_file_for_caller(self):
++        conn = Mock()
++        conn.getPrinters.return_value = {'other': {}, 'default': {}}
++        conn.getDefault.return_value = 'default'
++        conn.printFile.return_value = 42
++        with tempfile.NamedTemporaryFile() as stream:
++            self.assertEqual(report.print_report(conn, stream.name), 42)
++            self.assertTrue(Path(stream.name).exists())
++        self.assertEqual(conn.printFile.call_args.args[0], 'default')
++
++    def test_print_failure_and_missing_default(self):
++        conn = Mock()
++        conn.getPrinters.return_value = {'default': {}}
++        conn.getDefault.return_value = 'default'
++        conn.printFile.side_effect = cups.IPPError(1, 'offline')
++        self.assertIsNone(report.print_report(conn, 'report.pdf'))
++        conn.getDefault.return_value = None
++        self.assertIsNone(report.print_report(conn, 'report.pdf'))
++
++
++class ServiceTests(unittest.TestCase):
++    def setUp(self):
++        self.config = kiosk_config.read_config(ROOT / 'kiosk.ini')
++        self.config['report_delay'] = 0
++        self.queue = Queue()
++        self.sound = patch.object(utils, 'speak_status').start()
++        self.sleep = patch.object(service.time, 'sleep').start()
++        service.lang = (1, 'ENG')
++        service.conn = Mock()
++
++    def tearDown(self):
++        patch.stopall()
++
++    def test_empty_and_trailing_junk_barcodes_rejected(self):
++        with patch.object(report, 'get_report_from_host') as download:
++            for barcode in ('', '1234567#1234JUNK', '1234567#123456'):
++                self.assertFalse(service.bc_callback(barcode, self.config, self.queue))
++            download.assert_not_called()
++
++    def test_network_failure_and_non_pdf_are_nonfatal(self):
++        for result in ([None, None], [200, None]):
++            with patch.object(report, 'get_report_from_host', return_value=result), \
++                    patch.object(report, 'print_report') as printing:
++                self.assertFalse(service.bc_callback('1234567#1234', self.config, self.queue))
++                printing.assert_not_called()
++
++    def test_unready_report_message(self):
++        with patch.object(report, 'get_report_from_host', return_value=[409, None]):
++            self.assertFalse(service.bc_callback('1234567#1234', self.config, self.queue))
++        self.assertIn('\n', self.queue.get_nowait().ticket_value)
++
++    def test_pdf_cleanup_on_success_failure_or_invalid_pdf(self):
++        for job_id, pdf_error in ((42, None), (None, None), (42, ValueError('invalid PDF'))):
++            with self.subTest(job_id=job_id, pdf_error=pdf_error), tempfile.TemporaryDirectory() as folder:
++                path = Path(folder) / 'report.pdf'
++                path.write_bytes(b'%PDF-test')
++                with patch.object(report, 'get_report_from_host', return_value=[200, str(path)]) as download, \
++                        patch.object(utils, 'get_numpages_from_pdf', return_value=2, side_effect=pdf_error), \
++                        patch.object(report, 'print_report', return_value=job_id):
++                    success = service.bc_callback(']1234567#1234', self.config, self.queue)
++                self.assertEqual(success, job_id is not None and pdf_error is None)
++                self.assertFalse(path.exists())
++                self.assertIn('1234567%231234', download.call_args.args[0])
++
++    def test_worker_already_stopped_does_not_touch_hardware(self):
++        stop = threading.Event()
++        stop.set()
++        with patch.object(report, 'connect_to_cups') as connect:
++            service.service_thread(stop, config=self.config, queue_from_gui=Queue(), queue_to_gui=Queue())
++        connect.assert_not_called()
++
++    def test_ethernet_read_failure_is_nonfatal(self):
++        with patch.object(service.Path, 'read_text', side_effect=OSError()):
++            self.assertEqual(service.ethernet_speed(), 'unknown')
++
++
++class BarcodeTests(unittest.TestCase):
++    def test_start_failure_and_disconnection(self):
++        reader = kiosk_bcr.BarcodeReader()
++        with patch.object(kiosk_bcr.serial, 'Serial', side_effect=serial.SerialException('offline')):
++            reader.start()
++        self.assertFalse(reader.running)
++        reader.next()
++        connection = Mock()
++        type(connection).in_waiting = unittest.mock.PropertyMock(side_effect=serial.SerialException('unplugged'))
++        reader.serial_connection = connection
++        reader.running = True
++        reader.next()
++        self.assertFalse(reader.running)
++        connection.close.assert_called_once()
++
++    def test_bad_encoding_does_not_stop_reader(self):
++        callback = Mock()
++        reader = kiosk_bcr.BarcodeReader(callback=callback)
++        reader.serial_connection = Mock(in_waiting=1)
++        reader.serial_connection.readline.return_value = b'\xff\n'
++        reader.running = True
++        reader.next()
++        self.assertTrue(reader.running)
++        callback.assert_not_called()
++
++    def test_bounce_uses_monotonic_clock(self):
++        callback = Mock()
++        reader = kiosk_bcr.BarcodeReader(callback=callback, bounce=2)
++        reader.serial_connection = Mock(in_waiting=1)
++        reader.serial_connection.readline.return_value = b'1234567#1234\n'
++        reader.running = True
++        with patch.object(kiosk_bcr.time, 'monotonic', side_effect=[10, 11, 13, 13]):
++            reader.next()
++            reader.next()
++            reader.next()
++        self.assertEqual(callback.call_count, 2)
++
++
++class AnimationAndButtonTests(unittest.TestCase):
++    def test_gui_honors_custom_config_path(self):
++        with tempfile.TemporaryDirectory() as folder:
++            path = Path(folder) / 'custom.ini'
++            path.write_text('[INTERFACE]\nscreen_width=640\n')
++            app = Mock(worker_failed=False)
++            with patch.object(sys, 'argv', ['kiosk_main.py', '-c', str(path)]), \
++                    patch.object(kiosk_main, 'load_gif_frames', return_value={}), \
++                    patch.object(kiosk_main, 'KioskApp', return_value=app) as factory, \
++                    patch.object(service, 'service_thread'), \
++                    patch.object(kiosk_main.signal, 'signal'), \
++                    patch.object(kiosk_main.logging, 'basicConfig'):
++                self.assertEqual(kiosk_main.main(), 0)
++            self.assertEqual(factory.call_args.kwargs['config']['screen_width'], 640)
++            self.assertEqual(factory.call_args.kwargs['config']['assets_loader'], str(Path(folder) / 'assets'))
++
++    def test_worker_failure_exits_for_systemd_restart(self):
++        app = Mock()
++        app.slave_thread.is_alive.return_value = False
++        app.stop_event.is_set.return_value = False
++        kiosk_main.KioskApp.check_queue(app)
++        self.assertTrue(app.worker_failed)
++        app.quit_app.assert_called_once()
++        app.after.assert_not_called()
++
++    def test_legacy_pickle_is_not_loaded_and_source_changes_are_visible(self):
++        with tempfile.TemporaryDirectory() as folder:
++            source = Path(folder)
++            (source / 'img_cache').mkdir()
++            (source / 'img_cache' / 'icon.gif.pkl').write_bytes(b'invalid pickle')
++            with Image.new('RGB', (10, 10), 'red') as image:
++                image.save(source / 'icon.gif')
++            cache = animation.load_gif_frames(source / 'img_cache', 20, 30)
++            self.assertEqual(cache['icon.gif'][0].size, (20, 30))
++            with Image.new('RGB', (10, 10), 'blue') as image:
++                image.save(source / 'icon.gif')
++            self.assertEqual(animation.load_gif_frames(source)['icon.gif'][0].getpixel((0, 0)), (0, 0, 255, 255))
++
++    def test_restarting_animation_resets_cycle_count_and_cancels_timer(self):
++        label = Mock()
++        label.frames = ['frame']
++        label.current_frame = 8
++        label._curr_cycle = 9
++        label._after_id = 'old'
++        label._is_animating = True
++        label.delay = 50
++        label.stop_animation.side_effect = lambda: animation.AnimatedGifLabelAcc.stop_animation(label)
++        label._animate.side_effect = lambda: animation.AnimatedGifLabelAcc._animate(label)
++        animation.AnimatedGifLabelAcc.start_animation(label, 2)
++        label.after_cancel.assert_called_once_with('old')
++        self.assertEqual(label._curr_cycle, 1)
++        self.assertTrue(label._is_animating)
++        animation.AnimatedGifLabelAcc._animate(label)
++        self.assertFalse(label._is_animating)
++
++    def test_disable_buttons_uses_instance_queue_and_keeps_all_disabled(self):
++        frame = Mock()
++        frame.buttons = [Mock(), Mock(), Mock()]
++        frame.config = {'languages': ['LAT', 'ENG', 'RUS']}
++        frame.queue_from_gui = Queue()
++        kiosk_main.MainFrame.disable_buttons(frame, 1)
++        self.assertEqual(frame.queue_from_gui.get_nowait(), (1, 'ENG'))
++        for button in frame.buttons:
++            button.state_disable.assert_called_once()
++        button = Mock()
++        kiosk_main.KioskButton.idle(button)
++        self.assertNotIn('state', button.configure.call_args.kwargs)
++
++    def test_debounce_schedules_callback(self):
++        frame = Mock(selected_button=1)
++        kiosk_main.MainFrame.debounce_buttons(frame, 1000)
++        frame.enable_buttons.assert_not_called()
++        frame.after.assert_called_once_with(1000, frame.enable_buttons, 1)
++
++
++class SetupTests(unittest.TestCase):
++    def test_missing_ethernet_has_bounded_wait(self):
++        env = dict(os.environ, INTERFACE='kiosk-review-nonexistent', TOTAL_TIMEOUT='0')
++        result = subprocess.run(['bash', str(ROOT / 'wait-for-ethernet.sh')],
++                                env=env, capture_output=True, timeout=3)
++        self.assertEqual(result.returncode, 1)
++        self.assertIn(b'Ethernet unavailable', result.stdout)
++
++    def test_cmdline_idempotent_and_replaces_conflicting_values(self):
++        with tempfile.TemporaryDirectory() as folder:
++            path = Path(folder) / 'cmdline.txt'
++            path.write_text('console=tty1 consoleblank=60 fbcon=rotate:2 root=PARTUUID=test video=HDMI-A-1:1920x1080\n')
++            path.chmod(0o640)
++            boot.update_file(path, boot.cmdline_text(path))
++            first = path.read_text()
++            boot.update_file(path, boot.cmdline_text(path))
++            self.assertEqual(first, path.read_text())
++            self.assertEqual(first.count('consoleblank='), 1)
++            self.assertIn('root=PARTUUID=test', first)
++            self.assertIn('video=HDMI-A-1:1920x1080', first)
++            self.assertEqual(path.stat().st_mode & 0o777, 0o640)
++            self.assertEqual(len(list(Path(folder).glob('*.bak'))), 1)
++
++    def test_overlay_idempotent_and_preserves_sections(self):
++        with tempfile.TemporaryDirectory() as folder:
++            path = Path(folder) / 'config.txt'
++            path.write_text('[all]\ndtoverlay=vc4-kms-v3d\n[pi4]\nother=1\n')
++            boot.update_file(path, boot.config_text(path))
++            self.assertEqual(path.read_text().count('dtoverlay=vc4-kms-dsi-7inch'), 1)
++            self.assertEqual(boot.config_text(path), path.read_text())
++            self.assertIn('[pi4]\nother=1', path.read_text())
++
++    def test_bad_legacy_config_does_not_modify_cmdline(self):
++        with tempfile.TemporaryDirectory() as folder:
++            config, cmdline = Path(folder) / 'config.txt', Path(folder) / 'cmdline.txt'
++            config.write_text('[all]\n')
++            cmdline.write_text('root=test\n')
++            env = dict(os.environ, CMDLINE_FILE=str(cmdline))
++            result = subprocess.run(['bash', str(ROOT / 'update_config.sh'), str(config)],
++                                    env=env, capture_output=True, cwd='/tmp')
++            self.assertNotEqual(result.returncode, 0)
++            self.assertEqual(cmdline.read_text(), 'root=test\n')
++            self.assertEqual(config.read_text(), '[all]\n')
++
++    def test_boot_wrappers_work_from_other_directory(self):
++        with tempfile.TemporaryDirectory() as folder:
++            path = Path(folder) / 'config file.txt'
++            path.write_text('dtoverlay=vc4-kms-v3d\n')
++            for _ in range(2):
++                subprocess.run(['bash', str(ROOT / 'update_config_txt.sh'), str(path)],
++                               check=True, capture_output=True, cwd='/tmp')
++            self.assertEqual(path.read_text().count('dtoverlay=vc4-kms-dsi-7inch'), 1)
++            cmdline = Path(folder) / 'cmdline.txt'
++            cmdline.write_text('root=test\n')
++            for _ in range(2):
++                subprocess.run(['bash', str(ROOT / 'update_cmdline.sh'), str(cmdline)],
++                               check=True, capture_output=True, cwd='/tmp')
++            self.assertEqual(cmdline.read_text().count('consoleblank='), 1)
++
++    def test_cups_config_handles_commented_defaults_and_is_repeatable(self):
++        for text in ('# BrowseRemoteProtocols dnssd\n', 'BrowseRemoteProtocols dnssd cups\n',
++                     'BrowseRemoteProtocols none\n', 'BrowseRemoteProtocols dnssd\nBrowseRemoteProtocols cups\n'):
++            with self.subTest(text=text), tempfile.TemporaryDirectory() as folder:
++                path = Path(folder) / 'cups-browsed.conf'
++                path.write_text(text)
++                path.chmod(0o640)
++                for _ in range(2):
++                    subprocess.run(['bash', str(ROOT / 'change_cups-browsed.sh'), str(path)],
++                                   check=True, capture_output=True)
++                self.assertEqual(path.read_text().splitlines().count('BrowseRemoteProtocols none'), 1)
++                self.assertEqual(path.stat().st_mode & 0o777, 0o640)
++
++    def test_log_file_path_with_spaces(self):
++        with tempfile.TemporaryDirectory() as folder:
++            path = Path(folder) / 'logs with spaces' / 'kiosk.log'
++            subprocess.run(['bash', str(ROOT / 'make_logdirs.sh'), str(path)], check=True, capture_output=True)
++            self.assertTrue(path.is_file())
++
++    def test_every_shell_script_parses(self):
++        for path in ROOT.glob('*.sh'):
++            with self.subTest(path=path.name):
++                subprocess.run(['bash', '-n', str(path)], check=True, capture_output=True)
++
++
++if __name__ == '__main__':
++    logging.disable(logging.CRITICAL)
++    unittest.main()
+--- /dev/null
++++ after/tests/test_print_startup.py
+@@ -0,0 +1,116 @@
++"""Offline fixtures for clearing every printer's old jobs before CUPS starts."""
++import os
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++import unittest
++from unittest.mock import Mock, patch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++import kiosk_clear_print_jobs as cleanup
++import kiosk_report as report
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++class PrintStartupTests(unittest.TestCase):
++    def test_all_job_files_and_recovery_files_cleared_preserving_printer_files(self):
++        with tempfile.TemporaryDirectory() as folder:
++            spool, cache = Path(folder) / 'spool', Path(folder) / 'cache'
++            spool.mkdir()
++            cache.mkdir()
++            jobs = ('c00001', 'd00001-001', 'c00002.N', 'd00002-002', 'c100001.O', 'd100001-1000')
++            for name in jobs:
++                (spool / name).write_text('old job')
++            for name in ('printers.conf', 'printer.ppd', 'README', 'control', 'd00001-invalid'):
++                (spool / name).write_text('keep')
++            (spool / 'tmp').mkdir()
++            (spool / 'tmp' / 'keep').write_text('unrelated')
++            (cache / 'HP.data').write_text('printer cache')
++            for name in cleanup.CACHE_FILES:
++                (cache / name).write_text('NextJobId 10\n<Job 1>\nName Test Page\n</Job>\n')
++                (cache / name).chmod(0o640)
++            self.assertEqual(cleanup.clear_spool(spool, cache), len(jobs))
++            for name in jobs:
++                self.assertFalse((spool / name).exists())
++            self.assertEqual((spool / 'printers.conf').read_text(), 'keep')
++            self.assertEqual((spool / 'tmp' / 'keep').read_text(), 'unrelated')
++            self.assertEqual((cache / 'HP.data').read_text(), 'printer cache')
++            for name in cleanup.CACHE_FILES:
++                self.assertIn('NextJobId 100002', (cache / name).read_text())
++                self.assertNotIn('<Job', (cache / name).read_text())
++                self.assertEqual((cache / name).stat().st_mode & 0o777, 0o640)
++
++    def test_next_job_id_preserved_across_caches(self):
++        with tempfile.TemporaryDirectory() as folder:
++            root = Path(folder)
++            (root / 'job.cache').write_text('NextJobId 100\n')
++            (root / 'job.cache.O').write_text('NextJobId 200\n')
++            cleanup.clear_spool(root / 'missing-spool', root)
++            self.assertIn('NextJobId 200', (root / 'job.cache').read_text())
++
++    def test_dry_run_never_modifies_spool(self):
++        with tempfile.TemporaryDirectory() as folder:
++            root = Path(folder)
++            (root / 'c00001').write_text('job')
++            (root / 'job.cache').write_text('NextJobId 2\n<Job 1>\n')
++            self.assertEqual(cleanup.clear_spool(root, root, dry_run=True), 1)
++            self.assertEqual((root / 'c00001').read_text(), 'job')
++            self.assertIn('<Job', (root / 'job.cache').read_text())
++
++    def test_symlink_rejected_before_any_job_is_removed(self):
++        with tempfile.TemporaryDirectory() as folder:
++            root = Path(folder)
++            (root / 'c00001').write_text('keep until validation completes')
++            (root / 'outside').write_text('keep')
++            (root / 'd00001-001').symlink_to(root / 'outside')
++            with self.assertRaises(ValueError):
++                cleanup.clear_spool(root, root)
++            self.assertTrue((root / 'c00001').exists())
++            self.assertEqual((root / 'outside').read_text(), 'keep')
++
++    def test_configured_spool_and_cache_paths_are_used(self):
++        with tempfile.TemporaryDirectory() as folder:
++            path = Path(folder) / 'cups-files.conf'
++            path.write_text('#RequestRoot /ignored\nRequestRoot "/custom/spool with spaces"\nCacheDir /custom/cache # note\n')
++            self.assertEqual(cleanup.cups_directories(path),
++                             (Path('/custom/spool with spaces'), Path('/custom/cache')))
++            path.write_text('RequestRoot relative/path\n')
++            with self.assertRaises(ValueError):
++                cleanup.cups_directories(path)
++
++    def test_live_scheduler_refused_before_spool_modification(self):
++        with patch.object(sys, 'argv', ['kiosk_clear_print_jobs.py']), \
++                patch.object(cleanup.os, 'geteuid', return_value=0), \
++                patch.object(cleanup, 'scheduler_running', return_value=True), \
++                patch.object(cleanup, 'clear_spool') as clear:
++            with self.assertRaises(SystemExit) as exited:
++                cleanup.main()
++        self.assertEqual(exited.exception.code, 1)
++        clear.assert_not_called()
++
++    def test_test_page_submitted_after_cleanup_survives_printer_init(self):
++        conn = Mock()
++        conn.getDevices.return_value = {'usb://HP': {}}
++        conn.getPrinters.return_value = {'HP': {'device-uri': 'usb://HP'}}
++        conn.getDefault.return_value = 'HP'
++        conn.printTestPage.return_value = 7
++        self.assertEqual(report.print_report(conn), 7)
++        self.assertTrue(report.init_printer(conn, {'include_schemes': ['usb'], 'printers': {}}))
++        conn.cancelAllJobs.assert_not_called()
++        conn.deletePrinter.assert_not_called()
++
++    def test_systemd_covers_all_cups_activation_paths_and_runs_once(self):
++        unit = (ROOT / 'kiosk-clear-print-jobs.service').read_text()
++        self.assertIn('RemainAfterExit=yes', unit)
++        self.assertIn('DefaultDependencies=no', unit)
++        self.assertIn('Before=cups.service cups.socket cups.path', unit)
++        for name in ('cups.service', 'cups.socket', 'cups.path'):
++            dropin = (ROOT / 'systemd' / (name + '.d') / 'kiosk-clear-print-jobs.conf').read_text()
++            self.assertIn('Requires=kiosk-clear-print-jobs.service', dropin)
++            self.assertIn('After=kiosk-clear-print-jobs.service', dropin)
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- before/touchpad_rules.sh
++++ after/touchpad_rules.sh
+@@ -3,7 +3,7 @@
+ set -euo pipefail
+ 
+ RULES_FILE="/etc/udev/rules.d/99-waveshare-touch.rules"
+-TEMP_FILE="/tmp/waveshare_touch.rules.tmp"
++TEMP_FILE=""
+ 
+ create_temp_rules_file() {
+     local tmp;
+@@ -46,6 +46,11 @@
+ }
+ 
+ main() {
++    if [[ "$EUID" -ne 0 ]]; then
++        echo "Error: Script must be run as root" >&2
++        return 1
++    fi
++    TEMP_FILE=$(mktemp) || return 1
+     trap cleanup_temp_file EXIT
+ 
+     create_temp_rules_file || return 1
+--- before/update_cmdline.sh
++++ after/update_cmdline.sh
+@@ -1,29 +1,8 @@
+ #!/usr/bin/env bash
+-
+ set -euo pipefail
+-
+-CMDLINE_FILE="/boot/firmware/cmdline.txt"
+-BACKUP_FILE="${CMDLINE_FILE}.$(date +%Y%m%d-%H%M%S).bak"
+-
+-PARAMS="video=DSI-1:panel_orientation=right_side_up fbcon=rotate:1 consoleblank=0"
+-
+-# Verify the file exists
+-if [[ ! -f "$CMDLINE_FILE" ]]; then
+-    echo "Error: $CMDLINE_FILE does not exist." >&2
++SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
++if (( $# > 1 )); then
++    echo "Usage: $0 [cmdline_file]" >&2
+     exit 1
+ fi
+-
+-# Create a backup
+-cp -p "$CMDLINE_FILE" "$BACKUP_FILE"
+-echo "Backup created: $BACKUP_FILE"
+-
+-# Read current contents
+-current=$(<"$CMDLINE_FILE")
+-
+-# Append parameters only if not already present
+-if [[ "$current" == *"$PARAMS"* ]]; then
+-    echo "Parameters already present. No changes made."
+-else
+-    printf '%s %s\n' "$current" "$PARAMS" > "$CMDLINE_FILE"
+-    echo "Parameters appended successfully."
+-fi
++exec python3 "$SCRIPT_DIR/kiosk_boot_config.py" cmdline "${1:-${CMDLINE_FILE:-/boot/firmware/cmdline.txt}}"
+--- before/update_config.sh
++++ after/update_config.sh
+@@ -1,67 +1,8 @@
+ #!/usr/bin/env bash
+-
+-CONFIG_FILE=""
+-COMMAND_LINE_FILE="/boot/firmware/cmdline.txt"
+-
+-sanitize_config_file() {
+-    if [[ -z "$CONFIG_FILE" ]]; then
+-        printf "Error: No config file path provided\n" >&2
+-        return 1
+-    fi
+-
+-    if [[ ! -f "$CONFIG_FILE" ]]; then
+-        printf "Error: Config file not found: %s\n" "$CONFIG_FILE" >&2
+-        return 1
+-    fi
+-
+-    if [[ ! -r "$CONFIG_FILE" || ! -w "$CONFIG_FILE" ]]; then
+-        printf "Error: Config file is not readable or writable: %s\n" "$CONFIG_FILE" >&2
+-        return 1
+-    fi
+-}
+-
+-modify_config_file() {
+-    local temp_file; temp_file=$(mktemp) || return 1
+-    local found=0
+-    local line;
+-
+-    sed -i '/^# Additional overlays.*/a dtoverlay=pi3-disable-wifi\ndtoverlay=pi3-disable-bt' "$temp_file"
+-    sed -i '1 s|$| video=DSI-1:panel_orientation=right_side_up fbcon=rotate:1 consoleblank=0|' "$COMMAND_LINE_FILE"
+-
+-    while IFS= read -r line || [[ -n "$line" ]]; do
+-        if [[ "$line" =~ ^dtoverlay=vc4-kms-v3d$ ]]; then
+-            #printf "#%s\n" "$line" >> "$temp_file"
+-            printf "dtoverlay=vc4-kms-dsi-7inch\n" >> "$temp_file"
+-            found=1
+-        else
+-            printf "%s\n" "$line" >> "$temp_file"
+-        fi
+-    done < "$CONFIG_FILE"
+-    
+-    if [[ "$found" -eq 0 ]]; then
+-        rm -f "$temp_file"
+-        printf "Error: Target dtoverlay line not found in config file\n" >&2
+-        return 1
+-    fi
+-
+-    mv "$temp_file" "$CONFIG_FILE"
+-}
+-
+-main() {
+-    if [[ $# -ne 1 ]]; then
+-        printf "Usage: %s <path_to_config_file>\n" "$0" >&2
+-        return 1
+-    fi
+-
+-    CONFIG_FILE="$1"
+-
+-    if ! sanitize_config_file; then
+-        return 1
+-    fi
+-
+-    if ! modify_config_file; then
+-        return 1
+-    fi
+-}
+-
+-main "$@"
++set -euo pipefail
++SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
++if (( $# != 1 )); then
++    echo "Usage: $0 <config_file>" >&2
++    exit 1
++fi
++exec python3 "$SCRIPT_DIR/kiosk_boot_config.py" legacy "$1" --cmdline "${CMDLINE_FILE:-/boot/firmware/cmdline.txt}"
+--- before/update_config_txt.sh
++++ after/update_config_txt.sh
+@@ -1,78 +1,8 @@
+ #!/usr/bin/env bash
+-
+-CONFIG_FILE=""
+-BACKUP_FILE=""
+-
+-sanitize_config_file() {
+-    if [[ -z "$CONFIG_FILE" ]]; then
+-        printf "Error: No config file path provided\n" >&2
+-        return 1
+-    fi
+-
+-    if [[ ! -f "$CONFIG_FILE" ]]; then
+-        printf "Error: Config file not found: %s\n" "$CONFIG_FILE" >&2
+-        return 1
+-    fi
+-
+-    if [[ ! -r "$CONFIG_FILE" || ! -w "$CONFIG_FILE" ]]; then
+-        printf "Error: Config file is not readable or writable: %s\n" "$CONFIG_FILE" >&2
+-        return 1
+-    fi
+-}
+-
+-backup_config_file() {
+-    # Create a backup
+-    if ! cp -p "$CONFIG_FILE" "$BACKUP_FILE"; then
+-        return 1
+-    fi
+-}
+-
+-modify_config_file() {
+-    local temp_file; temp_file=$(mktemp) || return 1
+-    local found=0
+-    local line;
+-
+-    #sed -i '/^# Additional overlays.*/a dtoverlay=disable-wifi\ndtoverlay=disable-bt' "$CONFIG_FILE"
+-
+-    while IFS= read -r line || [[ -n "$line" ]]; do
+-        if [[ "$line" =~ ^dtoverlay=vc4-kms-v3d$ ]]; then
+-            printf "%s\n" "$line" >> "$temp_file"
+-            printf "dtoverlay=vc4-kms-dsi-7inch\n" >> "$temp_file"
+-            found=1
+-        else
+-            printf "%s\n" "$line" >> "$temp_file"
+-        fi
+-    done < "$CONFIG_FILE"
+-    
+-    if [[ "$found" -eq 0 ]]; then
+-        rm -f "$temp_file"
+-        printf "Error: Target dtoverlay line not found in config file\n" >&2
+-        return 1
+-    fi
+-
+-    mv "$temp_file" "$CONFIG_FILE"
+-}
+-
+-main() {
+-    if [[ $# -ne 1 ]]; then
+-        printf "Usage: %s <path_to_config_file>\n" "$0" >&2
+-        return 1
+-    fi
+-    CONFIG_FILE="$1"
+-    BACKUP_FILE="${CONFIG_FILE}.$(date +%Y%m%d-%H%M%S).bak"
+-
+-    if ! sanitize_config_file; then
+-        return 1
+-    fi
+-    if ! backup_config_file; then
+-        return 1
+-    else
+-        echo "Backup created: $BACKUP_FILE"
+-    fi
+-    
+-    if ! modify_config_file; then
+-        return 1
+-    fi
+-}
+-
+-main "$@"
++set -euo pipefail
++SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
++if (( $# != 1 )); then
++    echo "Usage: $0 <config_file>" >&2
++    exit 1
++fi
++exec python3 "$SCRIPT_DIR/kiosk_boot_config.py" config "$1"
+--- before/wait-for-ethernet.service
++++ after/wait-for-ethernet.service
+@@ -8,7 +8,7 @@
+ Type=oneshot
+ ExecStart=/opt/kiosk/wait-for-ethernet.sh
+ RemainAfterExit=yes
+-TimeoutStartSec=infinity
++TimeoutStartSec=190
+ StandardOutput=journal+console
+ StandardError=journal+console
+ 
+--- before/wait-for-ethernet.sh
++++ after/wait-for-ethernet.sh
+@@ -1,6 +1,12 @@
+ #!/bin/bash
+ 
+-INTERFACE="eth0"
++INTERFACE="${INTERFACE:-eth0}"
++TOTAL_TIMEOUT="${TOTAL_TIMEOUT:-180}"
++if [[ ! "$TOTAL_TIMEOUT" =~ ^[0-9]+$ ]]; then
++    echo "Error: TOTAL_TIMEOUT must be a nonnegative integer" >&2
++    exit 1
++fi
++DEADLINE=$((SECONDS + TOTAL_TIMEOUT))
+ CHECK_INTERVAL=2
+ DHCP_TIMEOUT=120
+ 
+@@ -11,8 +17,12 @@
+ 
+ has_ipv4()
+ {
+-    ip -4 -o addr show dev "$INTERFACE" scope global 2>/dev/null |
+-        grep -q 'inet '
++    local address
++    address=$(get_ipv4)
++    case "$address" in
++        ""|0.*|127.*|169.254.*) return 1 ;;
++    esac
++    return 0
+ }
+ 
+ get_ipv4()
+@@ -25,13 +35,22 @@
+ 
+ link_is_up()
+ {
+-    [[ "$(cat /sys/class/net/${INTERFACE}/carrier 2>/dev/null)" == "1" ]]
++    [[ "$(cat "/sys/class/net/${INTERFACE}/carrier" 2>/dev/null)" == "1" ]]
++}
++
++check_deadline()
++{
++    if (( SECONDS >= DEADLINE )); then
++        log "ERROR: Ethernet unavailable after ${TOTAL_TIMEOUT} seconds"
++        exit 1
++    fi
+ }
+ 
+ # Wait for eth0 to be created by the kernel
+ log "Waiting for ${INTERFACE}..."
+ 
+ while [[ ! -d "/sys/class/net/${INTERFACE}" ]]; do
++    check_deadline
+     sleep 1
+ done
+ 
+@@ -48,6 +67,7 @@
+ 
+     # Wait until physical Ethernet link exists
+     while ! link_is_up; do
++        check_deadline
+         sleep "$CHECK_INTERVAL"
+     done
+ 
+@@ -57,6 +77,7 @@
+     elapsed=0
+ 
+     while (( elapsed < DHCP_TIMEOUT )); do
++        check_deadline
+ 
+         if has_ipv4; then
+             IP_ADDRESS=$(get_ipv4)
+@@ -72,6 +93,7 @@
+             break
+         fi
+ 
++        check_deadline
+         sleep "$CHECK_INTERVAL"
+         ((elapsed += CHECK_INTERVAL))
+     done
+@@ -81,9 +103,9 @@
+         log "Retrying DHCP..."
+ 
+         # Ask NetworkManager to retry the connection
+-        nmcli device disconnect "$INTERFACE" >/dev/null 2>&1 || true
++        nmcli --wait 10 device disconnect "$INTERFACE" >/dev/null 2>&1 || true
+         sleep 2
+-        nmcli device connect "$INTERFACE" >/dev/null 2>&1 || true
++        nmcli --wait 10 device connect "$INTERFACE" >/dev/null 2>&1 || true
+     fi
+ 
+ done

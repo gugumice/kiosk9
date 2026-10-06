@@ -1,0 +1,14 @@
+[Unit]
+Description=Set Ethernet link speed
+After=NetworkManager.service
+After=sys-subsystem-net-devices-eth0.device
+Wants=NetworkManager.service
+BindsTo=sys-subsystem-net-devices-eth0.device
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for i in $(seq 1 30); do /usr/sbin/ethtool -s eth0 speed 10 duplex full autoneg off && exit 0; sleep 1; done; exit 1'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

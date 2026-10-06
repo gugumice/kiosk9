@@ -1,0 +1,5 @@
+customtkinter>=5.2,<7
+Pillow>=9.1
+pyserial>=3.5,<4
+pycups>=2.0,<3
+requests>=2.28,<3
