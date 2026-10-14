@@ -39,7 +39,7 @@ crontab -l > "$cron_temp" 2>/dev/null || true
 # Migrate the earlier entry without scheduling two reboots at the same time.
 sed -i '\|^02 10 \* \* \* sudo reboot 2>/home/pi/reboot.log$|d' "$cron_temp"
 if ! grep -Eq '^[[:space:]]*02[[:space:]]+10[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+/sbin/reboot[[:space:]]+# kiosk daily reboot$' "$cron_temp"; then
-    printf '\n02 10 * * * /sbin/reboot # kiosk daily reboot\n' >> "$cron_temp"
+    printf '\n2 4 * * * sudo reboot # kiosk daily reboot\n' >> "$cron_temp"
 fi
 crontab "$cron_temp"
 systemctl enable kiosk.service
